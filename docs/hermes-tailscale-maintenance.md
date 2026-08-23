@@ -1,7 +1,8 @@
 # Hermes private-Tailscale maintenance
 
-This branch deliberately contains no Desktop redesign. The production Mac app
-is pinned to the known-good Hermes Desktop 0.17.0 bundle and connects through:
+This branch deliberately contains no custom Desktop redesign. The production
+Mac app is built from official upstream (currently commit `981101239a06`; the
+upstream package version still reads `0.17.0`) and connects through:
 
 ```text
 Hermes Desktop -> http://127.0.0.1:9119
@@ -37,6 +38,8 @@ bash scripts/sync-hermes-fork.sh --stash-dirty
 ```
 
 The sync script has no Desktop build/install code and never opens or quits the
-app. Updating the Linux backend is handled separately by
-`~/.local/bin/update-hermes-backend.sh --apply`; its safe default is a
-read-only status/health check.
+app. The local `~/.local/bin/update-hermes-desktop.sh` wrapper additionally
+checks the installed signature, arm64 bundle, and official-upstream install
+stamp while keeping the same source-only behavior. Updating the Linux backend
+is handled separately by `~/.local/bin/update-hermes-backend.sh --apply`; its
+safe default is a read-only status/health check.
