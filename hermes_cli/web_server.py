@@ -671,12 +671,38 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+def _configured_public_host() -> str:
+    """Return the exact hostname declared by ``dashboard.public_url``.
+
+    A reverse proxy or tunnel forwards the public Host header to a dashboard
+    that may still be bound safely to loopback.  Treat only the operator's
+    validated public URL as an additional accepted host; never trust arbitrary
+    forwarded-host headers.
+    """
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+        if not public_url:
+            return ""
+        return (urllib.parse.urlparse(public_url).hostname or "").lower()
+    except Exception:
+        # Host validation is a security boundary.  A malformed config or an
+        # unexpected loader failure must fail closed, not disable the check.
+        return ""
+
+
+def _is_accepted_host(
+    host_header: str,
+    bound_host: str,
+    configured_public_host: str = "",
+) -> bool:
     """True if the Host header targets the interface we bound to.
 
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
+    - Exact hostname declared by ``dashboard.public_url`` (reverse proxies)
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
@@ -699,6 +725,10 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     else:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
+
+    public_host = configured_public_host.strip().lower()
+    if public_host and host_only == public_host:
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
@@ -732,7 +762,11 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        if not _is_accepted_host(
+            host_header,
+            bound_host,
+            _configured_public_host(),
+        ):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -16122,7 +16156,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    public_host = _configured_public_host()
+    if not _is_accepted_host(host_header, bound_host, public_host):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -16139,7 +16174,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _is_accepted_host(parsed.netloc, bound_host, public_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 

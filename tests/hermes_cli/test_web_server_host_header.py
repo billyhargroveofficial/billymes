@@ -47,6 +47,43 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_loopback_bind_accepts_only_configured_public_host(self):
+        """A tunnel may preserve its public Host while proxying to loopback.
+
+        Only the exact hostname explicitly declared in dashboard.public_url is
+        accepted; unrelated hosts remain blocked by the DNS-rebinding defence.
+        """
+        from hermes_cli.web_server import _is_accepted_host
+
+        public_host = "hermes-mujik.example.ts.net"
+        assert _is_accepted_host(public_host, "127.0.0.2", public_host)
+        assert _is_accepted_host(
+            public_host + ":8443",
+            "127.0.0.2",
+            public_host,
+        )
+        assert not _is_accepted_host(
+            "evil.example",
+            "127.0.0.2",
+            public_host,
+        )
+        assert not _is_accepted_host(
+            public_host + ".evil.example",
+            "127.0.0.2",
+            public_host,
+        )
+
+    def test_configured_public_host_uses_validated_public_url(self, monkeypatch):
+        from hermes_cli.dashboard_auth import prefix
+        from hermes_cli.web_server import _configured_public_host
+
+        monkeypatch.setattr(
+            prefix,
+            "resolve_public_url",
+            lambda: "https://Hermes-Mujik.example.ts.net:8443/hermes",
+        )
+        assert _configured_public_host() == "hermes-mujik.example.ts.net"
+
 
 
 class TestHostHeaderMiddleware:
@@ -89,6 +126,25 @@ class TestHostHeaderMiddleware:
         client = TestClient(app)
         resp = client.get("/api/status")
         # Should get through to the status endpoint, not a 400
+        assert resp.status_code != 400
+
+    def test_configured_public_host_reaches_http_app(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.2", raising=False)
+        monkeypatch.setattr(
+            ws,
+            "_configured_public_host",
+            lambda: "hermes-mujik.example.ts.net",
+        )
+
+        client = TestClient(ws.app)
+        resp = client.get(
+            "/api/status",
+            headers={"Host": "hermes-mujik.example.ts.net"},
+        )
         assert resp.status_code != 400
 
 
@@ -134,6 +190,27 @@ class TestWebSocketHostOriginGuard:
             headers={
                 "Host": "localhost:9119",
                 "Origin": "http://localhost:9119",
+            },
+        ):
+            pass
+
+    def test_configured_public_host_reaches_websocket_app(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        public_host = "hermes-mujik.example.ts.net"
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.2", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setattr(ws, "_configured_public_host", lambda: public_host)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": public_host,
+                "Origin": f"https://{public_host}",
             },
         ):
             pass
