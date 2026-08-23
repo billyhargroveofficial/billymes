@@ -21,11 +21,14 @@ Check remote state without changing refs or the worktree:
 bash scripts/sync-hermes-fork.sh --check
 ```
 
-Synchronize `main` from NousResearch and merge it into the maintenance branch:
+Synchronize `main` from NousResearch, merge it into the maintenance branch,
+and atomically push both non-forced refs to the fork:
 
 ```bash
 bash scripts/sync-hermes-fork.sh
 ```
+
+Use `--no-push` for a local-only synchronization.
 
 If the checkout intentionally has local edits:
 

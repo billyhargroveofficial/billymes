@@ -17,6 +17,7 @@ MAINTENANCE_BRANCH="${HERMES_MAINTENANCE_BRANCH:-codex/tailscale-maintenance}"
 CHECK_ONLY=0
 DRY_RUN=0
 STASH_DIRTY=0
+PUSH_CHANGES=1
 ORIGINAL_BRANCH=""
 STASH_CREATED=0
 STASH_REF=""
@@ -38,6 +39,7 @@ Options:
   --stash-dirty    Stash tracked and untracked edits, then restore them.
   --allow-dirty    Alias for --stash-dirty.
   --dry-run        Validate and print the synchronization plan only.
+  --no-push        Update local branches only; do not push the fork.
   --help           Show this help.
 EOF
 }
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --check) CHECK_ONLY=1 ;;
     --stash-dirty|--allow-dirty) STASH_DIRTY=1 ;;
     --dry-run) DRY_RUN=1 ;;
+    --no-push) PUSH_CHANGES=0 ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown option: $1 (use --help)" ;;
   esac
@@ -224,6 +227,13 @@ sync_source() {
     git_cmd merge --abort || true
     die "upstream merge conflicts in: ${conflicts:-unknown}"
   fi
+
+  if [[ "$PUSH_CHANGES" == 1 ]]; then
+    log "atomically pushing $MAIN_BRANCH and $MAINTENANCE_BRANCH to the fork"
+    git_cmd push --atomic origin \
+      "$MAIN_BRANCH:$MAIN_BRANCH" \
+      "$MAINTENANCE_BRANCH:$MAINTENANCE_BRANCH"
+  fi
 }
 
 main() {
@@ -238,6 +248,9 @@ main() {
   if [[ "$DRY_RUN" == 1 ]]; then
     check_state
     log "dry-run: would fast-forward $MAIN_BRANCH and merge it into $MAINTENANCE_BRANCH"
+    if [[ "$PUSH_CHANGES" == 1 ]]; then
+      log "dry-run: would atomically push both synchronized branches to origin"
+    fi
     log "dry-run: would not build, install, quit, or launch Hermes Desktop"
     return 0
   fi
