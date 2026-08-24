@@ -11,6 +11,7 @@ import {
 
 const bootstrapBackend = {
   activeRoot: '/tmp/hermes-home/hermes-agent',
+  installStamp: { commit: '981101239a064c020a9d18fc3b1060ae306934ed' },
   kind: 'bootstrap-needed',
   platform: 'linux'
 }
@@ -88,8 +89,8 @@ test('remote apply re-resolves the saved connection without ensuring a local run
   assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
 })
 
-test('an already-saved remote bypasses every local startup step', async () => {
-  const savedRemote = { baseUrl: 'https://gateway.example.com/hermes' }
+test('the saved remote-only Tailscale route bypasses every packaged local startup step', async () => {
+  const savedRemote = { authMode: 'oauth' as const, baseUrl: 'http://127.0.0.1:9119' }
   const options = startupOptions({ resolveRemote: vi.fn(async () => savedRemote) })
 
   assert.deepEqual(await runPrimaryBackendStartup(options), {
