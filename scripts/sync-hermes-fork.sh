@@ -181,7 +181,7 @@ remote_branch_sha() {
   # access remains healthy, turning a read-only updater check into a long hang.
   if [[ -n "$slug" ]] && command -v gh >/dev/null 2>&1; then
     encoded="${branch//\//%2F}"
-    if sha="$(gh api --silent "repos/$slug/git/ref/heads/$encoded" --jq '.object.sha' 2>/dev/null)" \
+    if sha="$(gh api "repos/$slug/git/ref/heads/$encoded" --jq '.object.sha' 2>/dev/null)" \
       && [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
       printf '%s\n' "$sha"
       return 0
