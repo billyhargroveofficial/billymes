@@ -168,7 +168,26 @@ finish() {
 }
 
 remote_branch_sha() {
-  local remote="$1" branch="$2" line
+  local remote="$1" branch="$2" line slug encoded sha
+
+  case "$remote" in
+    upstream) slug="$UPSTREAM_SLUG" ;;
+    origin) slug="$FORK_SLUG" ;;
+    *) slug="" ;;
+  esac
+
+  # Prefer the authenticated GitHub API when available. Repeated anonymous or
+  # SSH upload-pack probes can be temporarily throttled even while normal API
+  # access remains healthy, turning a read-only updater check into a long hang.
+  if [[ -n "$slug" ]] && command -v gh >/dev/null 2>&1; then
+    encoded="${branch//\//%2F}"
+    if sha="$(gh api --silent "repos/$slug/git/ref/heads/$encoded" --jq '.object.sha' 2>/dev/null)" \
+      && [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$sha"
+      return 0
+    fi
+  fi
+
   line="$(git_cmd ls-remote --heads "$remote" "refs/heads/$branch")" \
     || return 1
   printf '%s\n' "${line%%[[:space:]]*}"
