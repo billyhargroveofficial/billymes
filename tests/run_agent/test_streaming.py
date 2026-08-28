@@ -604,6 +604,54 @@ class TestReasoningStreaming:
         assert response.choices[0].message.reasoning_content == "Let me think about this"
         assert response.choices[0].message.content == "The answer is 42"
 
+    @pytest.mark.parametrize(
+        ("metadata_field", "metadata_value"),
+        [
+            ("extra_content", {"google": {"thought": True}}),
+            ("model_extra", {"extra_content": {"google": {"thought": True}}}),
+        ],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_google_thought_content_routes_to_reasoning_stream(
+        self, mock_close, mock_create, metadata_field, metadata_value
+    ):
+        """Vertex thought deltas must not leak into visible assistant text."""
+        from run_agent import AIAgent
+
+        thought_chunk = _make_stream_chunk(content="Planning the answer")
+        setattr(thought_chunk.choices[0].delta, metadata_field, metadata_value)
+        chunks = [
+            thought_chunk,
+            _make_stream_chunk(content="The answer is 42"),
+            _make_stream_chunk(finish_reason="stop"),
+        ]
+        reasoning_deltas = []
+        text_deltas = []
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="google/gemini-3.7-flash",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=text_deltas.append,
+            reasoning_callback=reasoning_deltas.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert reasoning_deltas == ["Planning the answer"]
+        assert text_deltas == ["The answer is 42"]
+        assert response.choices[0].message.reasoning_content == "Planning the answer"
+        assert response.choices[0].message.content == "The answer is 42"
+
 
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 
