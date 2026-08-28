@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_repo="$(cd -- "$script_dir/.." && pwd)"
+
+repo="${BILLYMES_REPO:-$default_repo}"
+production_branch="${BILLYMES_BRANCH:-billy/production}"
+origin_remote="${BILLYMES_ORIGIN_REMOTE:-origin}"
+upstream_remote="${BILLYMES_UPSTREAM_REMOTE:-upstream}"
+upstream_branch="${BILLYMES_UPSTREAM_BRANCH:-main}"
+mode="apply"
+push_enabled=1
+restart_enabled=1
+
+usage() {
+    cat <<'EOF'
+Usage: billymes-update [--check | --test] [--no-push] [--no-restart]
+
+  --check       Fetch and report upstream drift without changing code.
+  --test        Run the owned-patch regression gate on the current checkout.
+  --no-push     Test an isolated rebase without publishing or deploying it.
+  --no-restart  Do not restart Hermes services after a successful update.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --check) mode="check" ;;
+        --test) mode="test" ;;
+        --no-push) push_enabled=0 ;;
+        --no-restart) restart_enabled=0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# A local-only update must not restart long-running services into a revision
+# that has not been published to the fork yet.
+if ((!push_enabled)); then
+    restart_enabled=0
+fi
+
+gitc() {
+    git -C "$repo" "$@"
+}
+
+die() {
+    echo "billymes-update: $*" >&2
+    exit 1
+}
+
+resolve_python_bin() {
+    local tree="$1"
+    local candidate
+    for candidate in \
+        "$tree/.venv/bin/python" \
+        "$tree/venv/bin/python"; do
+        if [[ -x "$candidate" ]] && "$candidate" -c 'import pytest' 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    die "no test Python with pytest found in .venv/ or venv/"
+}
+
+resolve_live_env() {
+    local candidate
+    for candidate in "$repo/venv" "$repo/.venv"; do
+        if [[ -x "$candidate/bin/python" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    die "no live Python environment found in venv/ or .venv/"
+}
+
+resolve_uv_bin() {
+    local candidate="${BILLYMES_UV_BIN:-}"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    candidate="$(command -v uv 2>/dev/null || true)"
+    [[ -n "$candidate" ]] || die "uv is required for locked dependency sync"
+    printf '%s\n' "$candidate"
+}
+
+sync_staging_dependencies() {
+    local tree="$1"
+    local uv_bin
+    uv_bin="$(resolve_uv_bin)"
+    echo "→ Syncing isolated locked Python dependencies in staging..."
+    (
+        cd "$tree"
+        UV_PROJECT_ENVIRONMENT="$tree/.venv" \
+            "$uv_bin" sync --locked \
+                --extra all --extra dev --extra messaging --extra anthropic \
+                --reinstall-package hermes-agent
+    )
+}
+
+sync_live_dependencies() {
+    local source_tree="$1"
+    local dependencies_only="${2:-0}"
+    local live_env uv_bin
+    local sync_args=(
+        sync --locked --inexact
+        --extra all --extra messaging --extra anthropic
+    )
+    live_env="$(resolve_live_env)"
+    uv_bin="$(resolve_uv_bin)"
+    echo "→ Syncing locked Python dependencies in $live_env..."
+    if ((dependencies_only)); then
+        # The staging project itself is editable. Do not repoint the live
+        # environment at a temporary worktree that will immediately vanish.
+        sync_args+=(--no-install-project)
+    fi
+    (
+        cd "$source_tree"
+        # Keep optional/lazily installed packages while explicitly retaining
+        # the two extras used by this deployment (Telegram and Anthropic).
+        UV_PROJECT_ENVIRONMENT="$live_env" \
+            "$uv_bin" "${sync_args[@]}"
+    )
+}
+
+run_regressions() {
+    local tree="$1"
+    local python_bin
+    python_bin="$(resolve_python_bin "$tree")"
+    echo "→ Running Billymes regression gate in $tree..."
+    (
+        cd "$tree"
+        export HERMES_PYTHON="$python_bin"
+        "$python_bin" -c \
+            'import agent, pathlib, sys; root = pathlib.Path(sys.argv[1]).resolve(); loaded = pathlib.Path(agent.__file__).resolve(); assert root in loaded.parents, f"agent imported from {loaded}, expected under {root}"' \
+            "$tree"
+        scripts/run_tests.sh \
+            tests/agent/test_codex_responses_hosted_tool_projection.py \
+            tests/agent/test_context_references.py \
+            tests/agent/test_display_tool_failure.py \
+            tests/agent/transports/test_codex_transport.py \
+            tests/tools/test_code_execution.py \
+            tests/tools/test_code_kernel.py \
+            tests/tools/test_code_kernel_remote.py \
+            tests/tools/test_nested_tool_presentation.py \
+            tests/run_agent/test_tool_activity_heartbeat.py \
+            tests/gateway/test_telegram_commands_disabled.py \
+            tests/gateway/test_telegram_documents.py \
+            tests/gateway/test_telegram_rich_messages.py \
+            tests/hermes_cli/test_web_server_host_header.py \
+            tests/hermes_cli/test_account_usage_endpoint.py \
+            tests/hermes_cli/test_vertex_model_picker.py \
+            -q
+        scripts/run_tests.sh \
+            tests/test_hermes_state.py::TestSessionLifecycle::test_count_user_messages_groups_requested_sessions \
+            -q
+        scripts/run_tests.sh \
+            tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_sessions_exposes_user_turn_count \
+            -q
+        scripts/run_tests.sh tests/agent/test_prompt_builder.py \
+            -k 'skill_guidance_skips_quick_web_lookups or execution_guidance_does_not_refetch_injected_calendar_date or execution_guidance_calibrates_simple_lookup_depth' \
+            -q
+        scripts/run_tests.sh \
+            tests/test_tui_gateway_server.py::test_tui_tool_complete_prefers_explicit_provider_duration \
+            -q
+        scripts/run_tests.sh \
+            tests/run_agent/test_streaming.py::TestReasoningStreaming::test_google_thought_content_routes_to_reasoning_stream \
+            -q
+        "$python_bin" -m py_compile \
+            agent/codex_runtime.py \
+            agent/transports/codex.py \
+            hermes_cli/web_server.py \
+            plugins/platforms/telegram/adapter.py \
+            tools/code_execution_tool.py \
+            tools/code_kernel.py \
+            tools/code_kernel_remote.py \
+            tools/nested_tool_presentation.py \
+            tui_gateway/server.py
+        git diff --check
+    )
+}
+
+remote_branch_sha() {
+    local branch="$1"
+    gitc ls-remote --heads "$origin_remote" "refs/heads/$branch" \
+        | awk 'NR == 1 {print $1}'
+}
+
+run_hermes_cli() {
+    local hermes_bin
+    hermes_bin="$(command -v hermes 2>/dev/null || true)"
+    if [[ -n "$hermes_bin" ]]; then
+        "$hermes_bin" "$@"
+    else
+        "$(resolve_live_env)/bin/python" -m hermes_cli.main "$@"
+    fi
+}
+
+restart_services_and_check_health() {
+    local services=()
+    local unit profile active new_pid health_url healthy
+    local -A old_pids=()
+
+    if ((restart_enabled)) && command -v systemctl >/dev/null 2>&1; then
+        while read -r unit _rest; do
+            case "$unit" in
+                hermes-gateway*.service|hermes-serve.service|hermes-dashboard-tailscale.service)
+                    services+=("$unit")
+                    ;;
+            esac
+        done < <(systemctl --user list-unit-files --type=service --state=enabled --no-legend)
+    fi
+
+    if ((restart_enabled)) && ((${#services[@]})); then
+        echo "→ Draining and restarting Hermes services: ${services[*]}"
+        for unit in "${services[@]}"; do
+            old_pids["$unit"]="$(
+                systemctl --user show --property MainPID --value "$unit" 2>/dev/null \
+                    || printf '0'
+            )"
+            case "$unit" in
+                hermes-gateway.service)
+                    if ! run_hermes_cli gateway restart; then
+                        systemctl --user restart "$unit"
+                    fi
+                    ;;
+                hermes-gateway-*.service)
+                    profile="${unit#hermes-gateway-}"
+                    profile="${profile%.service}"
+                    if ! run_hermes_cli -p "$profile" gateway restart; then
+                        systemctl --user restart "$unit"
+                    fi
+                    ;;
+                hermes-serve*.service|hermes-dashboard-tailscale.service)
+                    systemctl --user restart "$unit"
+                    ;;
+            esac
+        done
+
+        for unit in "${services[@]}"; do
+            active=0
+            for _attempt in {1..60}; do
+                new_pid="$(
+                    systemctl --user show --property MainPID --value "$unit" 2>/dev/null \
+                        || printf '0'
+                )"
+                if systemctl --user is-active --quiet "$unit" \
+                    && [[ "$new_pid" != "0" ]] \
+                    && [[ "$new_pid" != "${old_pids[$unit]}" ]]; then
+                    active=1
+                    break
+                fi
+                sleep 1
+            done
+            ((active)) || die "service failed to restart onto a new PID: $unit"
+        done
+    fi
+
+    command -v curl >/dev/null 2>&1 || die "curl is required for health checks"
+    for health_url in ${BILLYMES_HEALTH_URLS:-http://127.0.0.1:9119/api/health}; do
+        echo "→ Waiting for $health_url"
+        healthy=0
+        for _attempt in {1..60}; do
+            if curl -fsS --max-time 2 "$health_url" >/dev/null; then
+                healthy=1
+                break
+            fi
+            sleep 1
+        done
+        ((healthy)) || die "health check failed: $health_url"
+    done
+}
+
+write_receipt() {
+    local old_sha="$1" new_sha="$2" target_sha="$3"
+    local expected_main="$4" expected_production="$5" phase="$6"
+    local receipt_tmp="$receipt_file.tmp.$$"
+    (
+        umask 077
+        {
+            printf 'old_production=%s\n' "$old_sha"
+            printf 'new_production=%s\n' "$new_sha"
+            printf 'target_upstream=%s\n' "$target_sha"
+            printf 'expected_origin_main=%s\n' "$expected_main"
+            printf 'expected_origin_production=%s\n' "$expected_production"
+            printf 'phase=%s\n' "$phase"
+        } >"$receipt_tmp"
+        mv -f "$receipt_tmp" "$receipt_file"
+    )
+}
+
+load_receipt() {
+    receipt_old=""
+    receipt_new=""
+    receipt_target=""
+    receipt_origin_main=""
+    receipt_origin_production=""
+    receipt_phase=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            old_production) receipt_old="$value" ;;
+            new_production) receipt_new="$value" ;;
+            target_upstream) receipt_target="$value" ;;
+            expected_origin_main) receipt_origin_main="$value" ;;
+            expected_origin_production) receipt_origin_production="$value" ;;
+            phase) receipt_phase="$value" ;;
+        esac
+    done <"$receipt_file"
+    [[ "$receipt_old" =~ ^[0-9a-f]{40,64}$ ]] \
+        && [[ "$receipt_new" =~ ^[0-9a-f]{40,64}$ ]] \
+        && [[ "$receipt_target" =~ ^[0-9a-f]{40,64}$ ]] \
+        && [[ -z "$receipt_origin_main" \
+            || "$receipt_origin_main" =~ ^[0-9a-f]{40,64}$ ]] \
+        && [[ -z "$receipt_origin_production" \
+            || "$receipt_origin_production" =~ ^[0-9a-f]{40,64}$ ]] \
+        && [[ "$receipt_phase" =~ ^(prepared|live|healthy)$ ]] \
+        || die "invalid update receipt: $receipt_file"
+}
+
+publish_refs() {
+    local source_ref="$1" target_main="$2"
+    local expected_main="$3" expected_production="$4"
+    local source_sha current_main current_production origin_main_ref fork_unique
+    source_sha="$(gitc rev-parse "$source_ref")"
+
+    echo "→ Publishing tested branches..."
+    current_main="$(remote_branch_sha "$upstream_branch")"
+    if [[ "$current_main" != "$target_main" ]]; then
+        [[ "$current_main" == "$expected_main" ]] \
+            || die "remote $upstream_branch moved independently; refusing to overwrite it"
+        if [[ -n "$current_main" ]]; then
+            origin_main_ref="refs/remotes/$origin_remote/$upstream_branch"
+            gitc fetch "$origin_remote" \
+                "+refs/heads/$upstream_branch:$origin_main_ref"
+            fork_unique="$(gitc rev-list --count "$target_main..$origin_main_ref")"
+            [[ "$fork_unique" == "0" ]] \
+                || die "$origin_remote/$upstream_branch has $fork_unique fork-only commit(s)"
+            gitc push "$origin_remote" \
+                "$target_main:refs/heads/$upstream_branch" \
+                "--force-with-lease=refs/heads/$upstream_branch:$current_main"
+        else
+            gitc push "$origin_remote" \
+                "$target_main:refs/heads/$upstream_branch" \
+                "--force-with-lease=refs/heads/$upstream_branch:"
+        fi
+    fi
+
+    current_production="$(remote_branch_sha "$production_branch")"
+    if [[ "$current_production" != "$source_sha" ]]; then
+        [[ "$current_production" == "$expected_production" ]] \
+            || die "remote $production_branch moved independently; refusing to overwrite it"
+        if [[ -n "$current_production" ]]; then
+            gitc push "$origin_remote" \
+                "$source_ref:refs/heads/$production_branch" \
+                "--force-with-lease=refs/heads/$production_branch:$current_production"
+        else
+            gitc push "$origin_remote" \
+                "$source_ref:refs/heads/$production_branch" \
+                "--force-with-lease=refs/heads/$production_branch:"
+        fi
+    fi
+}
+
+preflight_main() {
+    local target_main="$1" expected_main="$2"
+    local current_main origin_main_ref fork_unique
+    current_main="$(remote_branch_sha "$upstream_branch")"
+    [[ "$current_main" == "$expected_main" ]] \
+        || die "remote $upstream_branch moved during preflight"
+    if [[ -n "$current_main" && "$current_main" != "$target_main" ]]; then
+        origin_main_ref="refs/remotes/$origin_remote/$upstream_branch"
+        gitc fetch "$origin_remote" \
+            "+refs/heads/$upstream_branch:$origin_main_ref"
+        fork_unique="$(gitc rev-list --count "$target_main..$origin_main_ref")"
+        [[ "$fork_unique" == "0" ]] \
+            || die "$origin_remote/$upstream_branch has $fork_unique fork-only commit(s)"
+    fi
+}
+
+preflight_production() {
+    local trusted_local="$1" expected_production="$2"
+    local current_production trusted_sha
+    current_production="$(remote_branch_sha "$production_branch")"
+    [[ "$current_production" == "$expected_production" ]] \
+        || die "remote $production_branch moved during preflight"
+    if [[ -n "$current_production" ]]; then
+        trusted_sha="$(gitc rev-parse "$trusted_local")"
+        [[ "$current_production" == "$trusted_sha" ]] \
+            || die "remote $production_branch is not the trusted local production revision"
+    fi
+}
+
+[[ "$(gitc rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]] \
+    || die "not a Git checkout: $repo"
+command -v flock >/dev/null 2>&1 || die "flock is required"
+gitc check-ref-format --branch "$production_branch" >/dev/null \
+    || die "invalid production branch: $production_branch"
+
+lock_root="${XDG_RUNTIME_DIR:-/tmp}"
+exec 9>"$lock_root/billymes-update.lock"
+flock -n 9 || die "another Billymes update is already running"
+
+if [[ "$mode" == "test" ]]; then
+    [[ -z "$(gitc status --porcelain)" ]] || die "working tree is dirty"
+    run_regressions "$repo"
+    echo "✓ Billymes regression gate passed"
+    exit 0
+fi
+
+gitc remote get-url "$origin_remote" >/dev/null 2>&1 \
+    || die "missing remote '$origin_remote'"
+gitc remote get-url "$upstream_remote" >/dev/null 2>&1 \
+    || die "missing remote '$upstream_remote'"
+
+echo "→ Fetching $upstream_remote/$upstream_branch..."
+gitc fetch "$upstream_remote" \
+    "refs/heads/$upstream_branch:refs/remotes/$upstream_remote/$upstream_branch"
+upstream_ref="refs/remotes/$upstream_remote/$upstream_branch"
+upstream_sha="$(gitc rev-parse "$upstream_ref")"
+
+current_branch="$(gitc branch --show-current)"
+production_ref="refs/heads/$production_branch"
+gitc show-ref --verify --quiet "$production_ref" \
+    || die "missing local production branch '$production_branch'"
+production_sha="$(gitc rev-parse "$production_ref")"
+git_dir="$(gitc rev-parse --absolute-git-dir)"
+receipt_file="$git_dir/billymes-update-state"
+origin_main_sha="$(remote_branch_sha "$upstream_branch")"
+origin_production_sha="$(remote_branch_sha "$production_branch")"
+behind="$(gitc rev-list --count "$production_ref..$upstream_ref")"
+ahead="$(gitc rev-list --count "$upstream_ref..$production_ref")"
+echo "  branch=$current_branch upstream_behind=$behind owned_commits=$ahead"
+
+if [[ "$mode" == "check" ]]; then
+    [[ "$behind" == "0" ]] && echo "✓ Billymes is current" \
+        || echo "↑ $behind upstream commit(s) available"
+    [[ "$origin_main_sha" == "$upstream_sha" ]] \
+        || echo "! fork main is not mirrored to fetched upstream"
+    [[ "$origin_production_sha" == "$production_sha" ]] \
+        || echo "! fork production differs from local production"
+    [[ ! -f "$receipt_file" ]] || echo "! interrupted update receipt is pending"
+    exit 0
+fi
+
+[[ -z "$(gitc status --porcelain)" ]] || die "working tree is dirty"
+
+if [[ -f "$receipt_file" ]] && ((!push_enabled)); then
+    die "an interrupted update is pending; rerun without --no-push to recover it"
+fi
+
+# Recover the only interruptible named-branch window: staging was checked out,
+# but had not yet been renamed over production. The receipt proves both SHAs.
+if [[ -f "$receipt_file" && "$current_branch" != "$production_branch" ]]; then
+    load_receipt
+    if [[ "$current_branch" == billymes/update-* ]] \
+        && [[ "$(gitc rev-parse HEAD)" == "$receipt_new" ]] \
+        && [[ "$production_sha" == "$receipt_old" ]] \
+        && [[ "$receipt_phase" == "prepared" ]]; then
+        echo "→ Recovering interrupted pre-activation branch switch..."
+        interrupted_staging="$current_branch"
+        gitc switch "$production_branch"
+        gitc branch -D "$interrupted_staging"
+        rm -f "$receipt_file"
+        current_branch="$production_branch"
+    else
+        die "checkout is not on '$production_branch' and receipt cannot recover it"
+    fi
+fi
+
+[[ "$current_branch" == "$production_branch" ]] \
+    || die "checkout must be on '$production_branch' (currently '$current_branch')"
+
+# A receipt means local activation succeeded but publication may not have.
+# Revalidate the exact tested revision, restore services, then finish only the
+# recorded force-with-lease operations. No unrelated remote movement is lost.
+if [[ -f "$receipt_file" ]]; then
+    load_receipt
+    production_sha="$(gitc rev-parse "$production_ref")"
+    if [[ "$production_sha" == "$receipt_old" \
+        && "$receipt_phase" == "prepared" ]]; then
+        echo "→ Discarding stale pre-activation receipt..."
+        rm -f "$receipt_file"
+    elif [[ "$production_sha" == "$receipt_new" ]]; then
+        current_origin_main="$(remote_branch_sha "$upstream_branch")"
+        current_origin_production="$(remote_branch_sha "$production_branch")"
+        [[ "$current_origin_main" == "$receipt_origin_main" \
+            || "$current_origin_main" == "$receipt_target" ]] \
+            || die "fork main moved independently during interrupted update"
+        [[ "$current_origin_production" == "$receipt_origin_production" \
+            || "$current_origin_production" == "$receipt_new" ]] \
+            || die "fork production moved independently during interrupted update"
+        echo "→ Resuming interrupted Billymes deployment..."
+        sync_live_dependencies "$repo"
+        run_regressions "$repo"
+        restart_services_and_check_health
+        write_receipt \
+            "$receipt_old" "$receipt_new" "$receipt_target" \
+            "$receipt_origin_main" "$receipt_origin_production" healthy
+        publish_refs \
+            "$production_ref" "$receipt_target" \
+            "$receipt_origin_main" "$receipt_origin_production"
+        rm -f "$receipt_file"
+        echo "✓ Interrupted Billymes update recovered and published"
+        origin_main_sha="$(remote_branch_sha "$upstream_branch")"
+        origin_production_sha="$(remote_branch_sha "$production_branch")"
+        behind="$(gitc rev-list --count "$production_ref..$upstream_ref")"
+    else
+        die "receipt does not match local production; manual recovery required"
+    fi
+fi
+
+production_sha="$(gitc rev-parse "$production_ref")"
+
+if [[ "$behind" == "0" ]]; then
+    if ((!push_enabled)); then
+        echo "✓ Billymes is already current; nothing was published or deployed"
+        exit 0
+    fi
+    if [[ "$origin_main_sha" == "$upstream_sha" \
+        && "$origin_production_sha" == "$production_sha" ]]; then
+        echo "✓ Billymes is already current and published"
+        exit 0
+    fi
+
+    preflight_main "$upstream_sha" "$origin_main_sha"
+    if [[ "$origin_production_sha" == "$production_sha" ]]; then
+        publish_refs \
+            "$production_ref" "$upstream_sha" \
+            "$origin_main_sha" "$origin_production_sha"
+        echo "✓ Billymes fork main mirrored to upstream"
+        exit 0
+    fi
+
+    preflight_production "$production_ref" "$origin_production_sha"
+    echo "→ Validating and publishing the current local deployment..."
+    sync_live_dependencies "$repo"
+    run_regressions "$repo"
+    restart_services_and_check_health
+    write_receipt \
+        "$production_sha" "$production_sha" "$upstream_sha" \
+        "$origin_main_sha" "$origin_production_sha" healthy
+    publish_refs \
+        "$production_ref" "$upstream_sha" \
+        "$origin_main_sha" "$origin_production_sha"
+    rm -f "$receipt_file"
+    echo "✓ Billymes current production published"
+    exit 0
+fi
+
+old_production="$(gitc rev-parse "$production_ref")"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+staging_branch="billymes/update-$stamp-$$"
+staging_root="$(mktemp -d "${TMPDIR:-/tmp}/billymes-update.XXXXXX")"
+staging_dir="$staging_root/worktree"
+activation_started=0
+receipt_owned=0
+
+cleanup_staging() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if [[ -n "${staging_dir:-}" && -e "$staging_dir/.git" ]]; then
+        git -C "$staging_dir" rebase --abort >/dev/null 2>&1 || true
+        gitc worktree remove --force "$staging_dir" >/dev/null 2>&1 || true
+    fi
+    if ((activation_started)) \
+        && [[ "$(gitc branch --show-current)" == "$staging_branch" ]] \
+        && [[ "$(gitc rev-parse "$production_ref")" == "$old_production" ]]; then
+        gitc switch "$production_branch" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${staging_branch:-}" ]] \
+        && gitc show-ref --verify --quiet "refs/heads/$staging_branch" \
+        && [[ "$(gitc branch --show-current)" != "$staging_branch" ]]; then
+        gitc branch -D "$staging_branch" >/dev/null 2>&1 || true
+    fi
+    if ((receipt_owned)) \
+        && [[ "$(gitc rev-parse "$production_ref")" == "$old_production" ]]; then
+        rm -f "$receipt_file"
+    fi
+    if [[ -n "${staging_root:-}" && -d "$staging_root" ]]; then
+        rmdir "$staging_root" >/dev/null 2>&1 || true
+    fi
+    exit "$rc"
+}
+trap cleanup_staging EXIT INT TERM
+
+echo "→ Creating isolated staging worktree..."
+gitc worktree add -b "$staging_branch" "$staging_dir" "$production_ref"
+echo "→ Rebasing staging branch onto $upstream_ref..."
+git -C "$staging_dir" rebase "$upstream_ref"
+git -C "$staging_dir" diff --check "$upstream_ref...HEAD"
+new_production="$(git -C "$staging_dir" rev-parse HEAD)"
+
+node_manifest_changed=0
+if ! gitc diff --quiet "$old_production" "$new_production" -- \
+    package.json package-lock.json \
+    ':(glob)apps/*/package.json' \
+    ui-tui/package.json ':(glob)ui-tui/packages/*/package.json' \
+    web/package.json tests-js/package.json; then
+    node_manifest_changed=1
+fi
+
+web_changed=0
+if ! gitc diff --quiet "$old_production" "$new_production" -- \
+    package.json package-lock.json apps/shared ui-tui/package.json web; then
+    web_changed=1
+fi
+
+sync_staging_dependencies "$staging_dir"
+
+if ((node_manifest_changed || web_changed)); then
+    command -v npm >/dev/null 2>&1 || die "npm is required for Dashboard validation"
+    echo "→ Installing deterministic Node workspaces in staging..."
+    (
+        cd "$staging_dir"
+        npm ci --include=dev \
+            --workspace ui-tui --workspace web --include-workspace-root \
+            --no-fund --no-audit --prefer-offline --progress=false
+    )
+fi
+
+if ((web_changed)); then
+    echo "→ Building Dashboard assets in staging..."
+    (cd "$staging_dir" && npm run build --workspace web)
+fi
+
+[[ -z "$(git -C "$staging_dir" status --porcelain --untracked-files=no)" ]] \
+    || die "dependency sync or build changed tracked files"
+
+run_regressions "$staging_dir"
+
+if ((!push_enabled)); then
+    echo "✓ Isolated Billymes rebase passed; production was not changed"
+    exit 0
+fi
+
+origin_main_sha="$(remote_branch_sha "$upstream_branch")"
+origin_production_sha="$(remote_branch_sha "$production_branch")"
+preflight_main "$upstream_sha" "$origin_main_sha"
+preflight_production "$production_ref" "$origin_production_sha"
+
+# The expensive and failure-prone work happened in the isolated worktree.
+# Only the tested commit is now checked out briefly in the live tree; no reset,
+# clean, or untested branch switch is used.
+[[ "$(gitc rev-parse "$production_ref")" == "$old_production" ]] \
+    || die "local production branch moved during staging; refusing to deploy"
+[[ "$(gitc branch --show-current)" == "$production_branch" ]] \
+    || die "live checkout left '$production_branch' during staging"
+[[ -z "$(gitc status --porcelain)" ]] \
+    || die "live checkout became dirty during staging"
+
+write_receipt \
+    "$old_production" "$new_production" "$upstream_sha" \
+    "$origin_main_sha" "$origin_production_sha" prepared
+receipt_owned=1
+sync_live_dependencies "$staging_dir" 1
+
+gitc worktree remove --force "$staging_dir"
+staging_dir=""
+rmdir "$staging_root"
+staging_root=""
+
+activation_started=1
+gitc switch "$staging_branch"
+gitc branch -M "$production_branch"
+write_receipt \
+    "$old_production" "$new_production" "$upstream_sha" \
+    "$origin_main_sha" "$origin_production_sha" live
+trap - EXIT INT TERM
+
+sync_live_dependencies "$repo"
+restart_services_and_check_health
+write_receipt \
+    "$old_production" "$new_production" "$upstream_sha" \
+    "$origin_main_sha" "$origin_production_sha" healthy
+publish_refs \
+    "$production_ref" "$upstream_sha" \
+    "$origin_main_sha" "$origin_production_sha"
+rm -f "$receipt_file"
+
+echo "✓ Billymes updated and published: $old_production → $new_production"

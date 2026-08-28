@@ -1,0 +1,41 @@
+name: Billymes regressions
+
+on:
+  push:
+    branches:
+      - billy/production
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: billymes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Python and dependencies
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 \
+            --extra all --extra dev --extra messaging --extra anthropic
+
+      - name: Run owned-patch regression gate
+        run: |
+          source .venv/bin/activate
+          # The centralized gate includes both local and remote code-kernel
+          # suites alongside the hosted-tool presentation regression tests.
+          BILLYMES_REPO="$PWD" scripts/billymes-update --test
