@@ -30,7 +30,9 @@ tested candidate, and publishes it only after service health passes.
 For WebUI work, treat `webui/` as an in-tree package, not a separate checkout.
 Read `webui/AGENTS.md`; production source stays in this fork and only the
 `%h/billymes-ui/env` runtime file is external/private. Keep the production
-`/__mes/gateway` 404 and the hosted-tool presentation-ledger replay invariant.
+`/__mes/gateway` control plane immutable: authenticated local probes are quiet
+`204`, while unauthenticated access and mutations remain `404`. Preserve the
+hosted-tool presentation-ledger replay invariant.
 The WebUI also owns durable session selection, event-sequence replay, bounded
 history pagination, profile-scoped attachments, and key-gated production
 proxying; preserve those contracts when changing chat or transport code.

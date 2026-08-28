@@ -200,11 +200,41 @@ describe('production WebUI server', () => {
     }
   })
 
-  it('keeps the development control endpoint absent after access is granted', async () => {
-    const { server } = await fixture()
+  it('keeps production gateway control immutable without noisy authenticated probes', async () => {
+    const { server, tokens } = await fixture()
     const port = await listen(server)
     try {
       await expect(request(port, '/__mes/gateway')).resolves.toMatchObject({ status: 404 })
+      await expect(request(port, '/__mes/gateway', { method: 'DELETE' })).resolves.toMatchObject({
+        status: 404,
+      })
+      const login = await request(port, '/__access', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: accessKey }),
+      })
+      const cookie = login.headers['set-cookie']?.[0] ?? ''
+      await expect(
+        request(port, '/__mes/gateway', { headers: { Cookie: cookie } }),
+      ).resolves.toMatchObject({
+        status: 204,
+        body: '',
+        headers: expect.objectContaining({ 'cache-control': 'no-store' }),
+      })
+      await expect(
+        request(port, '/__mes/gateway', { method: 'DELETE', headers: { Cookie: cookie } }),
+      ).resolves.toMatchObject({
+        status: 204,
+        body: '',
+        headers: expect.objectContaining({ 'cache-control': 'no-store' }),
+      })
+      await expect(
+        request(port, '/__mes/gateway', { method: 'PUT', headers: { Cookie: cookie } }),
+      ).resolves.toMatchObject({ status: 404 })
+      await expect(
+        request(port, '/__mes/gateway', { method: 'POST', headers: { Cookie: cookie } }),
+      ).resolves.toMatchObject({ status: 404 })
+      expect(tokens.get).not.toHaveBeenCalled()
       await expect(
         request(port, '/chat/any', { headers: { Cookie: 'mes_session=bad' } }),
       ).resolves.toMatchObject({ status: 200, body: expect.stringContaining('Access required') })

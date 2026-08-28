@@ -12,9 +12,10 @@ systemd template; runtime values are supplied only by `%h/billymes-ui/env`
 
 `server/` owns the gateway proxy lifecycle. Each control or WebSocket lease
 must be released exactly once, and client/upstream close paths must tear down
-their peer. `/__mes/gateway` is development-only; the production wrapper must
-continue returning `404` so local same-origin runtime remains valid. Production
-is access-key gated: preserve `ACCESS_KEY_SHA256` comparison, signed HttpOnly
+their peer. `/__mes/gateway` is mutable only in development; the production
+wrapper gives authenticated local-mode `GET`/`DELETE` probes an empty,
+non-cacheable `204`, while unauthenticated probes and all mutation methods stay
+`404`. Production is access-key gated: preserve `ACCESS_KEY_SHA256` comparison, signed HttpOnly
 `mes_session`, pre-mint API/WebSocket authorization, and dynamic short-lived
 gateway-token minting from the external environment.
 

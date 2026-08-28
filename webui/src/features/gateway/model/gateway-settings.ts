@@ -178,7 +178,7 @@ export async function pushGatewaySettings(settings: GatewaySettings, signal?: Ab
       })
       // The production wrapper deliberately omits the dev control plane. Its
       // fixed same-origin runtime is still a healthy local-mode configuration.
-      if (res.status === 404) return null
+      if (res.status === 204 || res.status === 404) return null
       if (!res.ok) throw new Error(`gateway reset failed (${res.status})`)
       return parseGatewayRuntime(await res.json())
     }
@@ -211,6 +211,7 @@ export async function fetchGatewayRuntime(signal?: AbortSignal) {
       headers: runtimeClientHeaders(),
       signal: request.signal,
     })
+    if (res.status === 204) return null
     if (!res.ok) return null
     return parseGatewayRuntime(await res.json())
   } finally {

@@ -84,8 +84,9 @@ personal paths, service drop-ins, or a second WebUI history.
 Use `pnpm install --frozen-lockfile`, `pnpm test`, and `pnpm build` in
 `webui/`. Its development server is loopback-only and may not open SSH tunnels
 or mint credentials. The built-in production server intentionally has no
-`/__mes/gateway` mutation endpoint; `404` there is valid local same-origin
-operation. `scripts/billymes-update` owns WebUI dependency sync/build,
+mutable `/__mes/gateway` control plane: authenticated local-mode `GET`/`DELETE`
+probes return an empty, non-cacheable `204`, while unauthenticated probes and
+mutation methods remain `404`. `scripts/billymes-update` owns WebUI dependency sync/build,
 installation of the tracked user-service unit, restart of
 `billymes-ui.service`, and its configured health endpoint.
 

@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RUNTIME_CLIENT_HEADER } from '@/shared/api'
-import { pushGatewaySettings, readGatewaySettings, writeGatewaySettings } from './gateway-settings'
+import {
+  fetchGatewayRuntime,
+  pushGatewaySettings,
+  readGatewaySettings,
+  writeGatewaySettings,
+} from './gateway-settings'
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>()
@@ -178,5 +183,17 @@ describe('gateway settings control request', () => {
     await expect(
       pushGatewaySettings({ mode: 'local', origin: '', host: '', token: '' }),
     ).resolves.toBeNull()
+  })
+
+  it('accepts the production no-content control response without parsing JSON', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 204 })),
+    )
+
+    await expect(
+      pushGatewaySettings({ mode: 'local', origin: '', host: '', token: '' }),
+    ).resolves.toBeNull()
+    await expect(fetchGatewayRuntime()).resolves.toBeNull()
   })
 })

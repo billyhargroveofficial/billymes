@@ -64,8 +64,19 @@ export function createProductionServer({
     const pathname = requestPath(req.url)
     try {
       if (pathname === '/__health') return respond(res, 204, '')
-      // This dev-only endpoint must never turn into a login HTML response.
-      if (pathname === CONTROL_PATH) return respond(res, 404, 'not found')
+      // The production wrapper has a fixed runtime and no mutable dev control
+      // plane.  Authenticated read/reset probes get a quiet no-content answer
+      // so the shared client can discover that fact without two noisy 404s on
+      // every page load.  Keep the path absent to unauthenticated callers and
+      // reject every mutation method.
+      if (pathname === CONTROL_PATH) {
+        if (!session.cookieValid(req.headers.cookie)) return respond(res, 404, 'not found')
+        if (req.method === 'GET' || req.method === 'DELETE') {
+          res.setHeader('Cache-Control', 'no-store')
+          return respond(res, 204, '')
+        }
+        return respond(res, 404, 'not found')
+      }
       if (pathname === '/__access' && req.method === 'POST') {
         const key = await readAccessKey(req)
         if (!key || !session.keyMatches(key)) return rejectAccess(res)

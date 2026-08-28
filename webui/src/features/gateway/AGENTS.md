@@ -13,8 +13,10 @@ the root [`AGENTS.md`](../../../AGENTS.md) and
 - The `/__mes/gateway`, API, auth, and WebSocket paths require a loopback peer,
   loopback Host, and same-origin browser metadata.
 - `/__mes/gateway` is a Vite development control route. The production wrapper
-  intentionally returns `404`; local mode must treat that as a valid fixed
-  same-origin runtime, not a visible proxy failure.
+  has no mutable control plane: authenticated local-mode `GET`/`DELETE` probes
+  return an empty, non-cacheable `204`; unauthenticated probes and mutation
+  methods return `404`. Both the `204` contract and the legacy `404` fallback
+  mean a valid fixed same-origin runtime, not a visible proxy failure.
 - Do not add a second bind switch, silently broaden the allowlist, or place an
   internal host value in docs, fixtures, logs, or UI copy.
 
