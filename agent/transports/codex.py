@@ -135,6 +135,132 @@ def _xai_prefers_native_web_search() -> bool:
         return True
 
 
+def _codex_prefers_native_web_search() -> bool:
+    """True when Codex Responses should execute hosted web search inline.
+
+    ``codex-native`` is the OpenAI analogue of the xAI-native provider: the
+    configured Hermes function is a capability marker, but the actual search
+    belongs in the same Responses turn as the main model. Keeping it as a
+    client function forces an extra outer-model turn around every nested Luna
+    search and is several times slower than Codex CLI's built-in search.
+
+    Unlike the xAI collision guard, resolution failures stay client-side so a
+    custom provider is never silently bypassed.
+    """
+    try:
+        from agent.web_search_registry import get_active_search_provider
+
+        provider = get_active_search_provider()
+        if provider is not None:
+            return getattr(provider, "name", None) == "codex-native"
+
+        from tools.web_tools import _get_search_backend
+
+        return (_get_search_backend() or "").strip().lower() == "codex-native"
+    except Exception:
+        return False
+
+
+def _codex_native_web_search_tool() -> Dict[str, Any]:
+    """Build the hosted-search declaration with profile-aware context size."""
+    context_size = "medium"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        web = config.get("web") if isinstance(config, dict) else None
+        raw = web.get("codex_native") if isinstance(web, dict) else None
+        configured = raw.get("search_context_size") if isinstance(raw, dict) else None
+        if str(configured or "").strip().lower() in {"low", "medium", "high"}:
+            context_size = str(configured).strip().lower()
+    except Exception:
+        pass
+    return {"type": "web_search", "search_context_size": context_size}
+
+
+_HOSTED_WEB_SEARCH_EXECUTE_CODE_GUIDANCE = (
+    "HOSTED WEB SEARCH ROUTING: This Responses turn already exposes OpenAI's "
+    "provider-hosted web_search. Run independent or bulk search/open/find "
+    "operations directly through that hosted tool so the provider can batch "
+    "them. Never import or call hermes_tools.web_search inside execute_code on "
+    "this turn; that would create one nested Responses request per query and "
+    "lose hosted batching. Use execute_code only for local processing or other "
+    "sandbox tools after the hosted results are available."
+)
+
+
+def _steer_execute_code_to_hosted_web_search(
+    response_tools: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Add a provider-specific PTC routing invariant without mutating input.
+
+    The generic execute_code schema must keep ``hermes_tools.web_search`` for
+    non-Codex providers and fallback configurations.  Once this transport has
+    actually swapped the outer function for OpenAI's hosted tool, prepend a
+    stable instruction to execute_code so bulk searches stay provider-side.
+    """
+    rewritten: List[Dict[str, Any]] = []
+    for tool in response_tools:
+        if not (
+            isinstance(tool, dict)
+            and tool.get("type") == "function"
+            and tool.get("name") == "execute_code"
+        ):
+            rewritten.append(tool)
+            continue
+
+        updated = dict(tool)
+        description = str(updated.get("description") or "")
+        if _HOSTED_WEB_SEARCH_EXECUTE_CODE_GUIDANCE not in description:
+            updated["description"] = (
+                f"{_HOSTED_WEB_SEARCH_EXECUTE_CODE_GUIDANCE}\n\n{description}"
+            ).rstrip()
+        parameters = updated.get("parameters")
+        if isinstance(parameters, dict):
+            parameters = dict(parameters)
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                properties = dict(properties)
+                code_property = properties.get("code")
+                if isinstance(code_property, dict):
+                    code_property = dict(code_property)
+                    code_description = str(code_property.get("description") or "")
+                    if _HOSTED_WEB_SEARCH_EXECUTE_CODE_GUIDANCE not in code_description:
+                        code_property["description"] = (
+                            f"{_HOSTED_WEB_SEARCH_EXECUTE_CODE_GUIDANCE} "
+                            f"{code_description}"
+                        ).strip()
+                    properties["code"] = code_property
+                parameters["properties"] = properties
+            updated["parameters"] = parameters
+        rewritten.append(updated)
+    return rewritten
+
+
+def _codex_profile_prompt_cache_scope() -> Optional[str]:
+    """Return an opt-in profile-stable cache scope for Codex Responses.
+
+    The default Hermes scope remains conversation-isolated. Profiles that set
+    ``web.codex_native.profile_prompt_cache: true`` may share only their exact
+    static prefix (instructions + identical tool schemas) across fresh chats.
+    The resolved Hermes home keeps independently configured profiles in
+    distinct routing buckets; physical ``session_id`` headers remain unchanged.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        web = config.get("web") if isinstance(config, dict) else None
+        raw = web.get("codex_native") if isinstance(web, dict) else None
+        if not isinstance(raw, dict) or raw.get("profile_prompt_cache") is not True:
+            return None
+        from hermes_constants import get_hermes_home
+
+        return f"codex-profile:{get_hermes_home().resolve()}"
+    except Exception:
+        return None
+
+
 def _rename_client_web_search_for_xai(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rename client ``web_search`` → alias so xAI won't hijack it server-side."""
     rewritten: List[Dict[str, Any]] = []
@@ -520,6 +646,7 @@ class ResponsesApiTransport(ProviderTransport):
         reasoning_effort = clamp_effort(reasoning_effort, _supported)
 
         response_tools = _responses_tools(tools)
+        uses_native_codex_web_search = False
 
         # xAI server-side web search vs Hermes web providers.
         #
@@ -556,6 +683,34 @@ class ResponsesApiTransport(ProviderTransport):
                     response_tools = filtered
                 else:
                     response_tools = _rename_client_web_search_for_xai(response_tools)
+
+        # ChatGPT/Codex hosted web search. When ``codex-native`` is selected,
+        # replace Hermes's client function with the provider-executed built-in
+        # so search and reasoning stay inside one Responses turn (matching
+        # ``codex --search``). This is a 1:1 capability swap: no web tool is
+        # added when the user's active toolset did not already expose one.
+        if is_codex_backend and response_tools and _codex_prefers_native_web_search():
+            has_client_web_search = any(
+                isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and tool.get("name") == "web_search"
+                for tool in response_tools
+            )
+            if has_client_web_search:
+                response_tools = [
+                    tool
+                    for tool in response_tools
+                    if not (
+                        isinstance(tool, dict)
+                        and tool.get("type") == "function"
+                        and tool.get("name") == "web_search"
+                    )
+                ]
+                response_tools.append(_codex_native_web_search_tool())
+                response_tools = _steer_execute_code_to_hosted_web_search(
+                    response_tools
+                )
+                uses_native_codex_web_search = True
 
         # OpenCode Responses backends reserve web_search / search_files as
         # function names (HTTP 400 "custom function name 'X' is reserved",
@@ -615,8 +770,11 @@ class ResponsesApiTransport(ProviderTransport):
         # ``compression.in_place: false`` compaction rotates session_id
         # mid-conversation, and scoping by the physical id went cache-cold at
         # every rotation boundary (#79017).
+        profile_cache_scope = (
+            _codex_profile_prompt_cache_scope() if is_codex_backend else None
+        )
         _cache_scope = _cache_scope_from_session_id(
-            params.get("cache_scope_id") or session_id
+            profile_cache_scope or params.get("cache_scope_id") or session_id
         )
         cache_key = _content_cache_key(
             instructions, response_tools, _cache_scope
@@ -662,6 +820,12 @@ class ResponsesApiTransport(ProviderTransport):
                 )
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
+
+        if uses_native_codex_web_search:
+            include = list(kwargs.get("include") or [])
+            if "web_search_call.action.sources" not in include:
+                include.append("web_search_call.action.sources")
+            kwargs["include"] = include
 
         request_overrides = params.get("request_overrides")
         if request_overrides:

@@ -1466,6 +1466,46 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert "result_text" not in events[1][2]
 
 
+def test_tui_tool_complete_prefers_explicit_provider_duration(monkeypatch):
+    events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "hosted-duration-test",
+        {"tool_progress_mode": "all", "tool_started_at": {}},
+    )
+
+    server._on_tool_start(
+        "hosted-duration-test",
+        "hosted-1",
+        "web_search",
+        {"query": "Hermes"},
+    )
+    server._on_tool_progress(
+        "hosted-duration-test",
+        "tool.completed",
+        "web_search",
+        duration=9.75,
+        tool_call_id="hosted-1",
+    )
+    server._on_tool_complete(
+        "hosted-duration-test",
+        "hosted-1",
+        "web_search",
+        {"query": "Hermes"},
+        "completed",
+    )
+
+    assert [event_type for event_type, _, _ in events] == [
+        "tool.start",
+        "tool.complete",
+    ]
+    assert events[-1][2]["duration_s"] == pytest.approx(9.75)
+    assert server._sessions["hosted-duration-test"]["tool_duration_overrides"] == {}
+
+
 def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -2769,6 +2809,15 @@ def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():
     )
     assert server._tool_ctx("read_file", {"path": "/tmp/demo/package.json"}) == "package.json"
     assert server._tool_ctx("web_search", {"query": "weather in NYC"}) == "weather in NYC"
+    # Responses-hosted calls are projected with canonical Hermes names and
+    # argument shapes, so the TUI's normal card renderer gets a useful URL or
+    # command rather than an opaque provider-specific tool label.
+    assert server._tool_ctx("web_extract", {"urls": ["https://example.test/docs"]}) == (
+        "https://example.test/docs"
+    )
+    assert server._tool_ctx("search_files", {"pattern": "hosted tool cards"}) == (
+        "hosted tool cards"
+    )
 
 
 def test_history_to_messages_keeps_reasoning_only_assistant_turn():

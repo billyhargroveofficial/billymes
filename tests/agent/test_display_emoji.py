@@ -8,6 +8,11 @@ from agent.display import get_tool_emoji
 class TestGetToolEmoji:
     """Verify the skin → registry → fallback resolution chain."""
 
+    def test_computer_use_has_a_normal_tool_icon(self):
+        """Hosted computer cards project to this canonical Hermes tool."""
+        with mock_patch("agent.display._get_skin", return_value=None):
+            assert get_tool_emoji("computer_use") == "🖱️"
+
 
 
 
@@ -57,4 +62,3 @@ class TestSkinConfigToolEmojis:
         }
         skin = _build_skin_config(data)
         assert skin.tool_emojis == {"terminal": "🗡️", "patch": "⚒️"}
-

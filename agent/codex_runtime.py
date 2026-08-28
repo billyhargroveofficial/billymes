@@ -16,12 +16,15 @@ compatibility.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -998,6 +1001,7 @@ _TERMINAL_EVENT_TYPES = frozenset({
     "response.completed",
     "response.incomplete",
     "response.failed",
+    "response.cancelled",
 })
 
 
@@ -1015,6 +1019,476 @@ def _item_field(item: Any, name: str, default: Any = None) -> Any:
     if value is None and isinstance(item, dict):
         value = item.get(name, default)
     return value if value is not None else default
+
+
+# Responses hosted tools are executed by the provider.  They deliberately do
+# not enter the normal ``function_call`` path (and thus can never be dispatched
+# by Hermes), but users should still see the same live cards as for local
+# tools.  Keep this projector next to the raw SSE reader: only this layer sees
+# the incremental action metadata needed to fan a batched provider call out
+# into useful cards.
+_HOSTED_RESPONSE_TOOL_TYPES = frozenset({
+    "web_search_call",
+    "file_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "computer_call",
+    "local_shell_call",
+    "shell_call",
+    "mcp_call",
+})
+
+
+def _hosted_as_mapping(value: Any) -> dict[str, Any]:
+    """Best-effort, shallow SDK/dict normalization without serializing blobs."""
+    if isinstance(value, dict):
+        return value
+    dumped = getattr(value, "model_dump", None)
+    if callable(dumped):
+        try:
+            candidate = dumped()
+            if isinstance(candidate, dict):
+                return candidate
+        except Exception:
+            pass
+    data = getattr(value, "__dict__", None)
+    return data if isinstance(data, dict) else {}
+
+
+def _sanitize_hosted_url(text: str) -> str:
+    """Drop URL userinfo and signed/credential query parameters for display."""
+    try:
+        parsed = urlsplit(text)
+    except (TypeError, ValueError):
+        return "[redacted url]"
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return text
+    try:
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+    except ValueError:
+        return "[redacted url]"
+    sensitive = ("signature", "sig", "token", "key", "credential", "authorization", "auth")
+    query = [
+        (key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(marker in key.lower().replace("-", "_") for marker in sensitive)
+    ]
+    return urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), ""))
+
+
+def _hosted_text(value: Any, *, limit: int = 240) -> str:
+    """A conservative display-only scalar; never turn results into a dump."""
+    if isinstance(value, str):
+        text = value.strip()
+    elif isinstance(value, (int, float, bool)):
+        text = str(value)
+    else:
+        text = ""
+    # Data URLs and common secret-bearing fields must not appear in a tool card.
+    if text.startswith("data:") or len(text) > 16_384:
+        return ""
+    if text.startswith(("http://", "https://")):
+        text = _sanitize_hosted_url(text)
+    if re.fullmatch(r"[A-Za-z0-9_+/=.-]{80,}", text) or text.startswith("eyJ"):
+        return "[redacted]"
+    # A value beginning with either authorization scheme is inherently a
+    # credential, regardless of the enclosing field name.
+    if re.search(r"(?i)\b(?:bearer|basic)\s+\S+", text):
+        return "[redacted]"
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b\s*([=:]|\s)\s*\S+",
+        r"\1\2[redacted]",
+        text,
+    )
+    return text[:limit]
+
+
+def _hosted_command(value: Any) -> str:
+    """Display a command only when it is clearly free of credentials."""
+    if not isinstance(value, str):
+        entry = _hosted_as_mapping(value)
+        value = entry.get("command") or entry.get("text") or entry.get("value")
+    if not isinstance(value, str):
+        return ""
+    # Use a strict whole-command redaction: partial replacement is too easy to
+    # get wrong for quoted headers, env assignments, and shell expansions.
+    if re.search(
+        r"(?i)(authorization|api[_-]?key|cookie|credential|access[_ -]?key|"
+        r"secret|token|password|private[_ -]?key|bearer\s+\S+|basic\s+\S+)",
+        value,
+    ):
+        return "[redacted command]"
+    return _hosted_text(value)
+
+
+def _hosted_safe_arguments(value: Any, *, depth: int = 0) -> dict[str, Any]:
+    """Return bounded MCP input only; exclude outputs, blobs and secrets."""
+    if depth > 2:
+        return {}
+    mapping = _hosted_as_mapping(value)
+    if not mapping:
+        scalar = _hosted_text(value)
+        return {"input": scalar} if scalar else {}
+    safe: dict[str, Any] = {}
+    forbidden = (
+        "output", "result", "content", "image", "data", "base64", "secret",
+        "token", "password", "authorization", "api_key", "apikey", "cookie",
+        "credential", "access_key", "accesskey", "private_key", "privatekey",
+        "headers", "header", "auth",
+    )
+    for key, raw in list(mapping.items())[:12]:
+        key_text = str(key)
+        key_kind = re.sub(r"[-\s]", "_", key_text.lower())
+        if any(part in key_kind for part in forbidden):
+            continue
+        if isinstance(raw, (dict,)) or _hosted_as_mapping(raw):
+            nested = _hosted_safe_arguments(raw, depth=depth + 1)
+            if nested:
+                safe[key_text] = nested
+        elif isinstance(raw, (list, tuple)):
+            values = [_hosted_text(part) for part in raw[:8]]
+            values = [part for part in values if part]
+            if values:
+                safe[key_text] = values
+        else:
+            text = _hosted_text(raw)
+            if text:
+                safe[key_text] = text
+    return safe
+
+
+class _ResponsesHostedToolProjector:
+    """Presentation-only lifecycle bridge for Responses hosted tool calls.
+
+    A single ``web_search_call`` may contain several queries.  Each action is
+    represented as an independent visual call with a deterministic id, while
+    the original Responses item remains wholly provider-owned.
+    """
+
+    def __init__(self, agent: Any, *, fallback_started_at: float):
+        self.agent = agent
+        self._states: dict[str, dict[str, Any]] = {}
+        # Hosted item metadata is intentionally sparse while the provider is
+        # working: output_item.added / *.in_progress normally identify the
+        # item, but the query/action arrives only on output_item.done. Keep
+        # that early lifecycle timestamp even though there is not enough data
+        # to draw the per-query cards yet. If a compatible endpoint collapses
+        # the whole lifecycle into a terminal item, the physical request start
+        # is the best truthful lower-resolution fallback available.
+        self._item_started: dict[str, float] = {}
+        self._fallback_started_at = fallback_started_at
+        self._anonymous_counter = 0
+
+    @staticmethod
+    def _item_type(item: Any) -> str:
+        value = _item_field(item, "type", "")
+        return value.strip().lower() if isinstance(value, str) else ""
+
+    def _item_key(self, item: Any, event: Any) -> str:
+        for value in (
+            _item_field(item, "id"), _event_field(event, "item_id"),
+            _event_field(event, "output_index"),
+        ):
+            if isinstance(value, (str, int)) and str(value):
+                return str(value)
+        # Some providers emit an early action frame without item_id. Repeated
+        # copies of that frame should not create duplicate visual cards.
+        action = self._action(item, event)
+        if action:
+            try:
+                encoded = json.dumps(action, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                encoded = repr(action)
+            digest = hashlib.sha256(
+                f"{self._item_type(item)}:{encoded}".encode("utf-8")
+            ).hexdigest()[:24]
+            return f"anonymous-{digest}"
+        self._anonymous_counter += 1
+        return f"anonymous-{self._anonymous_counter}"
+
+    @staticmethod
+    def _action(item: Any, event: Any) -> dict[str, Any]:
+        for value in (_event_field(event, "action"), _item_field(item, "action")):
+            result = _hosted_as_mapping(value)
+            if result:
+                return result
+        # A few compatible endpoints flatten action fields onto the event/item.
+        for value in (event, item):
+            result = _hosted_as_mapping(value)
+            if any(key in result for key in ("queries", "query", "commands", "command", "url", "pattern")):
+                return result
+        return {}
+
+    def _candidates(
+        self, item: Any, event: Any, *, fallback: bool = False,
+    ) -> list[tuple[str, dict[str, Any], str]]:
+        item_type = self._item_type(item)
+        if item_type not in _HOSTED_RESPONSE_TOOL_TYPES:
+            return []
+        action = self._action(item, event)
+        action_type = str(action.get("type") or action.get("action_type") or "").lower()
+
+        def strings(key: str) -> list[str]:
+            raw = action.get(key)
+            singular = {"queries": "query", "commands": "command"}.get(key, key)
+
+            def one(part: Any) -> str:
+                text = _hosted_text(part)
+                if text:
+                    return text
+                # OpenAI SDKs/proxies may represent each batch member as an
+                # object such as {"query": "..."}, not just a string.
+                entry = _hosted_as_mapping(part)
+                return _hosted_text(
+                    entry.get(singular) or entry.get("text") or entry.get("value")
+                )
+
+            if isinstance(raw, (list, tuple)):
+                return [text for part in raw if (text := one(part))]
+            text = one(raw)
+            return [text] if text else []
+
+        if item_type == "web_search_call":
+            if action_type in {"open_page", "open", "open_url"}:
+                url = _hosted_text(action.get("url") or action.get("page_url"))
+                # This remains a provider-executed Responses call.  Only the
+                # presentation identity is the same one Hermes uses for its
+                # own page reader, so every surface gets the usual icon,
+                # friendly verb and URL preview instead of an opaque
+                # ``web_fetch`` card.
+                return [("web_extract", {"urls": [url]} if url else {}, url)]
+            if action_type in {"find_in_page", "find", "find_page"}:
+                pattern = _hosted_text(action.get("pattern") or action.get("query"))
+                url = _hosted_text(action.get("url") or action.get("page_url"))
+                # There is no client-dispatchable ``find_in_page`` tool in
+                # Hermes.  Present it as a read of the target page, retaining
+                # the provider's search term as display-only metadata.
+                args = {"urls": [url]} if url else {}
+                if pattern:
+                    args["find_pattern"] = pattern
+                if url:
+                    preview = url
+                else:
+                    preview = pattern
+                return [("web_extract", args, preview)]
+            queries = strings("queries") or strings("query") or strings("search_query")
+            # Query fallback handles providers that omit action.type.
+            return [("web_search", {"query": query}, query) for query in queries] or (
+                [("web_search", {}, "")] if fallback else []
+            )
+
+        if item_type == "file_search_call":
+            queries = strings("queries") or strings("query")
+            # Hosted vector-store search is still hosted; ``search_files`` is
+            # the canonical Hermes presentation for a file lookup.
+            return [("search_files", {"pattern": query}, query) for query in queries] or (
+                [("search_files", {}, "")] if fallback else []
+            )
+
+        if item_type in {"shell_call", "local_shell_call"}:
+            if item_type == "local_shell_call":
+                # The OpenAI SDK represents local_shell.action.command as an
+                # argv array. It is one hosted execution, not one execution
+                # per argv member, so preserve a single visual card.
+                raw_command = action.get("command")
+                if isinstance(raw_command, (list, tuple)):
+                    command = " ".join(
+                        text for part in raw_command if (text := _hosted_command(part))
+                    )
+                else:
+                    command = _hosted_command(raw_command)
+                return [("terminal", {"command": command} if command else {}, command)] if (
+                    command or fallback
+                ) else []
+            raw_commands = action.get("commands")
+            if not isinstance(raw_commands, (list, tuple)):
+                raw_commands = action.get("command")
+            if isinstance(raw_commands, (list, tuple)):
+                commands = [text for part in raw_commands if (text := _hosted_command(part))]
+            else:
+                command = _hosted_command(raw_commands)
+                commands = [command] if command else []
+            return [("terminal", {"command": command}, command) for command in commands] or (
+                [("terminal", {}, "")] if fallback else []
+            )
+
+        if item_type == "code_interpreter_call":
+            code = _hosted_text(action.get("code") or _item_field(item, "code"), limit=500)
+            return [("execute_code", {"code": code} if code else {}, code)]
+        if item_type == "computer_call":
+            action_name = _hosted_text(action.get("type") or action.get("action_type"))
+            return [("computer_use", {"action": action_name} if action_name else {}, action_name)]
+        if item_type == "mcp_call":
+            def field(name: str) -> Any:
+                return action.get(name) or _event_field(event, name) or _item_field(item, name)
+
+            server = _hosted_text(field("server_label") or field("server"))
+            tool = _hosted_text(field("name") or field("tool"))
+            name = f"mcp.{server}.{tool}" if server and tool else "mcp"
+            raw_arguments = field("arguments")
+            if isinstance(raw_arguments, str):
+                try:
+                    raw_arguments = json.loads(raw_arguments)
+                except (TypeError, ValueError):
+                    raw_arguments = None
+            args = _hosted_safe_arguments(raw_arguments)
+            if not (server and tool) and not fallback:
+                # Metadata commonly arrives after output_item.added. Waiting
+                # avoids a generic or partially named card followed by a
+                # second fully named one when the remaining metadata arrives.
+                return []
+            preview = _hosted_text(tool or server)
+            return [(name, args, preview)]
+        # Image-generation actions are intentionally opaque: image data and
+        # outputs are provider-owned and must never be rendered as a dump.
+        return [("image_generate", {}, "")]
+
+    @staticmethod
+    def _call_id(item_key: str, name: str, index: int) -> str:
+        # Stable across added/done frames, and distinct inside one batched item.
+        digest = hashlib.sha256(
+            f"responses-hosted:{item_key}:{name}:{index}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"hosted_{digest}"
+
+    def _start(
+        self,
+        key: str,
+        name: str,
+        args: dict[str, Any],
+        preview: str,
+        *,
+        started_at: float,
+    ) -> None:
+        state = self._states.get(key)
+        if state is not None:
+            return
+        self._states[key] = {
+            "name": name,
+            "args": args,
+            "started": started_at,
+            "done": False,
+        }
+        progress = getattr(self.agent, "tool_progress_callback", None)
+        if callable(progress):
+            try:
+                progress("tool.started", name, preview or None, args)
+            except Exception:
+                logger.debug("hosted tool progress start failed", exc_info=True)
+        callback = getattr(self.agent, "tool_start_callback", None)
+        if callable(callback):
+            try:
+                callback(key, name, args)
+            except Exception:
+                logger.debug("hosted tool start callback failed", exc_info=True)
+
+    def _complete(self, key: str, *, is_error: bool = False, result: str = "completed") -> None:
+        state = self._states.get(key)
+        if state is None or state["done"]:
+            return
+        state["done"] = True
+        duration = max(0.0, time.monotonic() - state["started"])
+        safe_result = _hosted_text(result, limit=500) or ("failed" if is_error else "completed")
+        progress = getattr(self.agent, "tool_progress_callback", None)
+        if callable(progress):
+            try:
+                progress(
+                    "tool.completed",
+                    state["name"],
+                    None,
+                    None,
+                    duration=duration,
+                    is_error=is_error,
+                    result=safe_result,
+                    tool_call_id=key,
+                )
+            except Exception:
+                logger.debug("hosted tool progress completion failed", exc_info=True)
+        callback = getattr(self.agent, "tool_complete_callback", None)
+        if callable(callback):
+            try:
+                callback(key, state["name"], state["args"], safe_result)
+            except Exception:
+                logger.debug("hosted tool completion callback failed", exc_info=True)
+        # Provider-hosted calls never pass through Hermes' client-side tool
+        # executor, so without this bridge observer hooks (including per-turn
+        # usage footers) falsely report zero tools. Emit the same
+        # terminal hook shape as a normal dispatched tool, exactly once per
+        # projected batch member; _complete's done guard prevents duplicates.
+        try:
+            from model_tools import _emit_post_tool_call_hook
+
+            _emit_post_tool_call_hook(
+                function_name=state["name"],
+                function_args=state["args"],
+                result=safe_result,
+                task_id=str(getattr(self.agent, "task_id", "") or ""),
+                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                tool_call_id=key,
+                turn_id=str(getattr(self.agent, "_current_turn_id", "") or ""),
+                api_request_id=str(
+                    getattr(self.agent, "_current_api_request_id", "") or ""
+                ),
+                duration_ms=max(0, int(duration * 1000)),
+                status="error" if is_error else "success",
+                error_type="hosted_tool_error" if is_error else None,
+                error_message=safe_result if is_error else None,
+            )
+        except Exception:
+            logger.debug("hosted tool post_tool_call hook failed", exc_info=True)
+
+    def observe(
+        self, event: Any, *, completed: bool = False, force_error: bool = False,
+    ) -> None:
+        item = _event_field(event, "item")
+        if item is None:
+            # Delta frames often have an item id plus action metadata, without
+            # nesting an item. Make a tiny safe proxy for early projection.
+            event_type = _event_field(event, "type", "")
+            suffix = str(event_type).split("response.", 1)[-1].split(".", 1)[0]
+            item = {"id": _event_field(event, "item_id"), "type": suffix}
+        item_type = self._item_type(item)
+        if item_type not in _HOSTED_RESPONSE_TOOL_TYPES:
+            return
+        item_key = self._item_key(item, event)
+        if item_key not in self._item_started:
+            # A done-only provider gives us no item-specific boundary. Do not
+            # manufacture a near-zero duration by starting and completing the
+            # card on the same frame; use the physical request boundary.
+            self._item_started[item_key] = (
+                self._fallback_started_at if completed else time.monotonic()
+            )
+        item_started_at = self._item_started[item_key]
+        candidates = self._candidates(item, event, fallback=completed)
+        command_index = _event_field(event, "command_index")
+        for index, (name, args, preview) in enumerate(candidates):
+            stable_index = (
+                command_index
+                if isinstance(command_index, int) and len(candidates) == 1
+                else index
+            )
+            key = self._call_id(item_key, name, stable_index)
+            self._start(
+                key,
+                name,
+                args,
+                preview,
+                started_at=item_started_at,
+            )
+            if completed:
+                status = _item_field(item, "status", "")
+                error = _item_field(item, "error")
+                failed = force_error or bool(error) or (
+                    isinstance(status, str)
+                    and status.lower() in {"failed", "incomplete", "cancelled"}
+                )
+                self._complete(key, is_error=failed, result="failed" if failed else "completed")
+
+    def settle_pending(self, *, is_error: bool) -> None:
+        for key, state in list(self._states.items()):
+            if not state["done"]:
+                self._complete(key, is_error=is_error, result="stream ended before hosted tool completed" if is_error else "completed")
 
 
 def _raise_stream_error(event: Any) -> None:
@@ -1064,6 +1538,8 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    agent: Any = None,
+    hosted_fallback_started_at: float | None = None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -1138,14 +1614,40 @@ def _consume_codex_event_stream(
     # cannot distinguish a real response.completed from EOF/interruption.
     saw_response_completed = False
     next_output_sequence = 0
+    hosted_tools = (
+        _ResponsesHostedToolProjector(
+            agent,
+            fallback_started_at=(
+                hosted_fallback_started_at
+                if isinstance(hosted_fallback_started_at, (int, float))
+                and not isinstance(hosted_fallback_started_at, bool)
+                else time.monotonic()
+            ),
+        )
+        if agent is not None
+        else None
+    )
 
-    for event in event_iter:
+    event_iterator = iter(event_iter)
+    while True:
+        try:
+            event = next(event_iterator)
+        except StopIteration:
+            break
+        except BaseException:
+            # Transport/generator failures bypass terminal Responses frames.
+            # Never leave presentation-only hosted cards stuck in progress.
+            if hosted_tools is not None:
+                hosted_tools.settle_pending(is_error=True)
+            raise
         if on_event is not None:
             try:
                 on_event(event)
             except (TimeoutError, InterruptedError):
                 # Control-flow signals from watchdog/cancellation hooks must
                 # propagate, not get swallowed as "debug noise".
+                if hosted_tools is not None:
+                    hosted_tools.settle_pending(is_error=True)
                 raise
             except Exception:
                 # Genuine bugs in third-party debug/log hooks shouldn't break
@@ -1163,7 +1665,21 @@ def _consume_codex_event_stream(
         # but never appear in the terminal set.  Surface them as a structured
         # exception so the credential pool + error classifier see the body.
         if event_type == "error":
+            if hosted_tools is not None:
+                hosted_tools.settle_pending(is_error=True)
             _raise_stream_error(event)
+
+        # Hosted calls can publish their action (notably a batch of web
+        # queries) before output_item.added/done. Project as soon as the wire
+        # contains enough metadata; ``observe`` is idempotent across frames.
+        if hosted_tools is not None:
+            hosted_tools.observe(
+                event,
+                completed=(
+                    event_type == "response.output_item.done"
+                    or event_type.endswith(".command_done")
+                ),
+            )
 
         # Track the phase of the active streamed message item.  Codex/Harmony
         # ``commentary``/``analysis`` text is mid-turn preamble/progress
@@ -1357,6 +1873,17 @@ def _consume_codex_event_stream(
                     terminal_error = getattr(resp_obj, "error", None)
                     if terminal_error is None and isinstance(resp_obj, dict):
                         terminal_error = resp_obj.get("error")
+                # Terminal output is display-only input for hosted cards.
+                # Keep deliberately ignoring it for final-response assembly.
+                if hosted_tools is not None:
+                    terminal_output = _item_field(resp_obj, "output", [])
+                    if isinstance(terminal_output, (list, tuple)):
+                        for terminal_item in terminal_output:
+                            hosted_tools.observe(
+                                {"type": "response.output_item.done", "item": terminal_item},
+                                completed=True,
+                                force_error=event_type != "response.completed",
+                            )
             if event_type == "response.completed":
                 saw_response_completed = True
                 terminal_status = terminal_status or "completed"
@@ -1364,6 +1891,19 @@ def _consume_codex_event_stream(
                 terminal_status = terminal_status or "incomplete"
             elif event_type == "response.failed":
                 terminal_status = terminal_status or "failed"
+            elif event_type == "response.cancelled":
+                terminal_status = terminal_status or "cancelled"
+            if hosted_tools is not None:
+                # Event type is authoritative here. ``terminal_status`` starts
+                # as "completed" for compatibility with malformed frames, so
+                # using it could incorrectly mark an explicit incomplete/
+                # failed terminal event as success.
+                if event_type == "response.completed":
+                    hosted_tools.settle_pending(is_error=False)
+                elif event_type in {
+                    "response.incomplete", "response.failed", "response.cancelled",
+                }:
+                    hosted_tools.settle_pending(is_error=True)
             # Stop on terminal event.
             break
 
@@ -1440,9 +1980,16 @@ def _consume_codex_event_stream(
     # signal the SDK's high-level helper used to raise as
     # ``RuntimeError("Didn't receive a `response.completed` event.")``.
     if not saw_terminal and not output:
+        if hosted_tools is not None:
+            hosted_tools.settle_pending(is_error=True)
         raise RuntimeError(
             "Codex Responses stream did not emit a terminal response"
         )
+
+    # A closed iterator with usable partial output is still a stream closure,
+    # not a successful hosted-tool completion.
+    if not saw_terminal and hosted_tools is not None:
+        hosted_tools.settle_pending(is_error=True)
 
     assembled_text = "".join(collected_text_deltas)
 
@@ -1625,6 +2172,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
+        request_started_at = time.monotonic()
         intercepted_events = []
         writer_token = {"value": None}
 
@@ -1727,6 +2275,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 final = _consume_codex_event_stream(
                     event_stream,
                     model=api_kwargs.get("model"),
+                    agent=agent,
+                    hosted_fallback_started_at=request_started_at,
                     on_text_delta=_on_text_delta,
                     on_reasoning_delta=_on_reasoning_delta,
                     on_commentary_message=(

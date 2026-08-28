@@ -1,6 +1,7 @@
 export const TOOL_VERBS: Record<string, string> = {
   browser: 'browsing',
   clarify: 'asking',
+  computer_use: 'using computer',
   create_file: 'creating',
   delegate_task: 'delegating',
   delete_file: 'deleting',

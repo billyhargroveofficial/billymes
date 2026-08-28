@@ -447,6 +447,10 @@ _RESPONSES_BUILTIN_TOOL_TYPES = {
     "image_generation",
     "computer_use_preview",
     "local_shell",
+    # OpenAI's hosted shell declaration is ``shell``; its emitted output item
+    # is named ``shell_call`` and is handled separately during normalization.
+    # Keep it server-side: it must never be normalized as a Hermes function.
+    "shell",
 }
 
 
@@ -1518,6 +1522,23 @@ def _format_responses_error(error_obj: Any, response_status: str) -> str:
 # Full response normalization
 # ---------------------------------------------------------------------------
 
+def _responses_as_object(value: Any) -> Any:
+    """Recursively adapt raw JSON Responses frames to the SDK's attr shape.
+
+    Streaming transports may hand us plain dicts while the official SDK hands
+    typed objects. Normalization must make the same hosted-tool decision for
+    both, especially because hosted calls are intentionally ignored here.
+    """
+    if isinstance(value, dict):
+        return SimpleNamespace(**{
+            str(key): _responses_as_object(item) for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return [_responses_as_object(item) for item in value]
+    if isinstance(value, tuple):
+        return [_responses_as_object(item) for item in value]
+    return value
+
 def _normalize_codex_response(
     response: Any,
     *,
@@ -1530,6 +1551,7 @@ def _normalize_codex_response(
     differs from the one that minted the encrypted_content blob and drop
     the item instead of triggering HTTP 400 invalid_encrypted_content.
     """
+    response = _responses_as_object(response) if isinstance(response, dict) else response
     response_status = getattr(response, "status", None)
     if isinstance(response_status, str):
         response_status = response_status.strip().lower()
@@ -1547,6 +1569,10 @@ def _normalize_codex_response(
     )
 
     output = getattr(response, "output", None)
+    if isinstance(output, list):
+        # The raw Responses stream stores completion items as JSON dicts. Make
+        # their shape match SDK objects before inspecting type/content below.
+        output = [_responses_as_object(item) if isinstance(item, dict) else item for item in output]
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
         # delivered entirely via stream events. Check output_text as a
@@ -1614,6 +1640,7 @@ def _normalize_codex_response(
         "image_generation_call",
         "computer_call",
         "local_shell_call",
+        "shell_call",
         "mcp_call",
     }
 

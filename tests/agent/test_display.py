@@ -264,6 +264,27 @@ class TestBuildToolLabel:
         assert label.startswith("Reading ")
         assert "example.com/page" in label
 
+    def test_hosted_projection_canonical_cards_use_normal_tool_presentation(self):
+        """Hosted calls are provider-owned but have ordinary Hermes labels."""
+        from agent.display import build_tool_label
+
+        assert build_tool_preview(
+            "web_extract", {"urls": ["https://example.test/page"]}
+        ) == "https://example.test/page"
+        assert build_tool_label("web_extract", {"urls": ["https://example.test/page"]}) == (
+            "Reading https://example.test/page"
+        )
+        assert build_tool_label("search_files", {"pattern": "quarterly report"}) == (
+            "Searching files for quarterly report"
+        )
+        assert build_tool_label("terminal", {"command": "pwd"}) == "Running pwd"
+        assert build_tool_label("execute_code", {"code": "print('ok')"}) == (
+            "Running code print('ok')"
+        )
+        assert build_tool_label("computer_use", {"action": "click"}) == (
+            "Using computer click"
+        )
+
 
 
 

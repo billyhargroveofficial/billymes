@@ -7614,6 +7614,9 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
                 session.setdefault("edit_snapshots", {})[tool_call_id] = snapshot
         except Exception:
             pass
+        # A stable id can be replayed after a reconnect or retry. Never let a
+        # stale explicit duration from an abandoned lifecycle leak into it.
+        session.setdefault("tool_duration_overrides", {}).pop(tool_call_id, None)
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload: dict[str, object] = {
@@ -7642,10 +7645,23 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     session = _sessions.get(sid)
     snapshot = None
     started_at = None
+    duration_override = None
     if session is not None:
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
-    duration_s = time.time() - started_at if started_at else None
+        duration_override = session.setdefault("tool_duration_overrides", {}).pop(
+            tool_call_id, None
+        )
+    if (
+        isinstance(duration_override, (int, float))
+        and not isinstance(duration_override, bool)
+        and duration_override >= 0
+    ):
+        duration_s = float(duration_override)
+    elif started_at is not None:
+        duration_s = time.time() - started_at
+    else:
+        duration_s = None
     if duration_s is not None:
         payload["duration_s"] = duration_s
     try:
@@ -7692,6 +7708,26 @@ def _on_tool_progress(
     _args: dict | None = None,
     **_kwargs,
 ):
+    # Some provider-hosted calls reveal their arguments only on the terminal
+    # SSE frame. Their structured tool.start/tool.complete callbacks therefore
+    # arrive back-to-back, while this progress event carries the real duration
+    # measured from the earlier provider lifecycle frame. Preserve it by the
+    # stable call id so _on_tool_complete emits that authoritative value.
+    if event_type == "tool.completed":
+        tool_call_id = _kwargs.get("tool_call_id")
+        duration = _kwargs.get("duration")
+        session = _sessions.get(sid)
+        if (
+            session is not None
+            and isinstance(tool_call_id, str)
+            and tool_call_id
+            and isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and duration >= 0
+        ):
+            session.setdefault("tool_duration_overrides", {})[tool_call_id] = float(
+                duration
+            )
     if not _tool_progress_enabled(sid):
         return
     if event_type == "tool.started" and name:

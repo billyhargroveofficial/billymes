@@ -464,7 +464,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "skill_view": "name", "skills_list": "category",
         "cronjob": "action",
         "execute_code": "code", "browser_exec": "code", "delegate_task": "goal",
-        "clarify": "question", "skill_manage": "name",
+        "clarify": "question", "skill_manage": "name", "computer_use": "action",
     }
 
     # browser_exec: prefer the leading `# …` comment as a friendly step label
@@ -648,6 +648,7 @@ _TOOL_VERBS: dict[str, str] = {
     "search_files": "Searching files",
     "terminal": "Running",
     "execute_code": "Running code",
+    "computer_use": "Using computer",
     "image_generate": "Generating image",
     "video_generate": "Generating video",
     "text_to_speech": "Generating speech",
@@ -1585,6 +1586,8 @@ def _get_cute_tool_message(
         code = args.get("code", "")
         first_line = code.strip().split("\n")[0] if code.strip() else ""
         return _wrap(f"┊ 🐍 exec      {_trunc(first_line, 35)}  {dur}")
+    if tool_name == "computer_use":
+        return _wrap(f"┊ 🖱️  computer  {_trunc(args.get('action', 'working'), 35)}  {dur}")
     if tool_name == "browser_exec":
         label = _browser_exec_step_label(args)
         if label is not None:

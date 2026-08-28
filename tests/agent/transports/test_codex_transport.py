@@ -652,6 +652,38 @@ class TestCodexBuildKwargs:
         assert first_run["x-client-request-id"] == second_run["x-client-request-id"]
         assert first_run["x-client-request-id"] != other_job["x-client-request-id"]
 
+    def test_codex_profile_cache_scope_reuses_static_prefix_across_new_sessions(
+        self, transport, monkeypatch
+    ):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setattr(
+            codex_mod,
+            "_codex_profile_prompt_cache_scope",
+            lambda: "codex-profile:/home/test/.hermes",
+        )
+        first = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "First"}],
+            tools=[],
+            session_id="session_one",
+            is_codex_backend=True,
+        )
+        second = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Second"}],
+            tools=[],
+            session_id="session_two",
+            is_codex_backend=True,
+        )
+        assert first["prompt_cache_key"] == second["prompt_cache_key"]
+        assert (
+            first["extra_headers"]["x-client-request-id"]
+            == second["extra_headers"]["x-client-request-id"]
+        )
+        assert first["extra_headers"]["session_id"] == "session_one"
+        assert second["extra_headers"]["session_id"] == "session_two"
+
 
 
 
@@ -797,6 +829,92 @@ class TestCodexBuildKwargs:
             t.get("type") == "function" and t.get("name") == "web_search"
             for t in tools
         )
+
+    def test_codex_native_backend_swaps_client_search_for_hosted_tool(
+        self, transport, monkeypatch
+    ):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setattr(
+            codex_mod, "_codex_prefers_native_web_search", lambda: True
+        )
+        monkeypatch.setattr(
+            codex_mod,
+            "_codex_native_web_search_tool",
+            lambda: {"type": "web_search", "search_context_size": "medium"},
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Search."}],
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object", "properties": {
+                        "query": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "execute_code",
+                    "description": "Run programmatic tool calls.",
+                    "parameters": {"type": "object", "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "Python source.",
+                        }}}}},
+            ],
+            is_codex_backend=True,
+            reasoning_config={"effort": "xhigh"},
+        )
+        tools = kw["tools"]
+        assert {
+            "type": "web_search", "search_context_size": "medium"
+        } in tools
+        assert not any(
+            tool.get("type") == "function" and tool.get("name") == "web_search"
+            for tool in tools
+        )
+        assert any(
+            tool.get("type") == "function" and tool.get("name") == "read_file"
+            for tool in tools
+        )
+        execute_code = next(
+            tool
+            for tool in tools
+            if tool.get("type") == "function" and tool.get("name") == "execute_code"
+        )
+        assert "provider-hosted web_search" in execute_code["description"]
+        assert "never import or call hermes_tools.web_search" in (
+            execute_code["description"].lower()
+        )
+        assert "provider-hosted web_search" in (
+            execute_code["parameters"]["properties"]["code"]["description"]
+        )
+        assert "web_search_call.action.sources" in kw["include"]
+        assert "reasoning.encrypted_content" in kw["include"]
+
+    def test_codex_non_native_backend_keeps_client_search(
+        self, transport, monkeypatch
+    ):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setattr(
+            codex_mod, "_codex_prefers_native_web_search", lambda: False
+        )
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Search."}],
+            tools=[{"type": "function", "function": {
+                "name": "web_search", "description": "Search the web.",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string"}}}}}],
+            is_codex_backend=True,
+        )
+        assert any(
+            tool.get("type") == "function" and tool.get("name") == "web_search"
+            for tool in kw["tools"]
+        )
+        assert not any(tool.get("type") == "web_search" for tool in kw["tools"])
 
     # --- Grok reasoning-effort capability allowlist ---
     # api.x.ai 400s with "Model X does not support parameter reasoningEffort"

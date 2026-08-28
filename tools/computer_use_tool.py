@@ -24,6 +24,7 @@ registry.register(
     handler=lambda args, **kw: handle_computer_use(args, **kw),
     check_fn=check_computer_use_requirements,
     requires_env=[],
+    emoji="🖱️",
     description=(
         "Universal desktop control via cua-driver (macOS, Windows, Linux). Works with any "
         "tool-capable model (Anthropic, OpenAI, OpenRouter, local vLLM, "
