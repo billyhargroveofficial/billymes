@@ -86,6 +86,14 @@ ledger, including batch fan-out, terminal-turn reconciliation, and reload
 replay. Never solve a UI reload by adding synthetic provider/tool messages to
 the Hermes transcript.
 
+Intermediate Codex commentary is already durable inside the canonical
+assistant row's Responses sidecar. History endpoints expose only its semantic,
+redacted `interim_messages` display projection and strip raw provider replay
+fields (`api_content`, `reasoning_details`, and `codex_*`); the WebUI restores
+those stable segments before the hosted-card segment
+and final response. Do not persist duplicate commentary rows, weaken the
+profile display gates, or replace provider ids with content matching.
+
 ## Native Codex and replay ownership
 
 The production stack includes the fork's native Codex OAuth transport. It

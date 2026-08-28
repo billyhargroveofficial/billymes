@@ -2101,6 +2101,66 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["pagination"]["limit"] == 500
 
+    def test_get_session_messages_projects_codex_commentary_without_sidecars(
+        self, monkeypatch
+    ):
+        """Reload hydration gets durable commentary without exposing replay JSON."""
+        from hermes_state import SessionDB
+
+        monkeypatch.setattr(
+            "hermes_cli.web_routers.sessions._interim_messages_enabled_for_profile",
+            lambda _profile: True,
+        )
+        db = SessionDB()
+        try:
+            db.create_session(session_id="codex-commentary-display", source="desktop")
+            db.append_message(
+                "codex-commentary-display",
+                "assistant",
+                "FINAL",
+                api_content="FINAL plus private model scaffold",
+                reasoning_details=[
+                    {"type": "reasoning.encrypted", "data": "private-signature"}
+                ],
+                codex_reasoning_items=[
+                    {"type": "reasoning", "encrypted_content": "private-blob"}
+                ],
+                codex_output_items=[
+                    {"type": "web_search_call", "id": "private-provider-item"}
+                ],
+                codex_message_items=[
+                    {
+                        "type": "message",
+                        "id": "commentary-1",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "PRELUDE"}],
+                    },
+                    {
+                        "type": "message",
+                        "id": "final-1",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "FINAL"}],
+                    },
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/codex-commentary-display/messages")
+        assert resp.status_code == 200
+        row = resp.json()["messages"][0]
+        assert row["interim_messages"] == [{"id": "commentary-1", "text": "PRELUDE"}]
+        for private_key in (
+            "api_content",
+            "reasoning_details",
+            "codex_message_items",
+            "codex_output_items",
+            "codex_reasoning_items",
+        ):
+            assert private_key not in row
+
     def test_get_session_messages_default_hides_compacted_rows(self):
         """The endpoint default matches get_messages: active rows only.
 
@@ -2298,6 +2358,7 @@ class TestWebServerEndpoints:
             "offset": 0,
             "order": "latest",
             "returned": 500,
+            "user_turn_offset": 1,
         }
         assert len(payload["messages"]) == 500
         assert payload["messages"][0]["content"] == "msg 1"

@@ -8,7 +8,13 @@ import {
   requestJson,
   withProfile,
 } from '@/shared/api'
-import type { SessionContentPart, SessionInfo, SessionMessage, ToolCallRaw } from '../model/types'
+import type {
+  SessionContentPart,
+  SessionInfo,
+  SessionInterimMessage,
+  SessionMessage,
+  ToolCallRaw,
+} from '../model/types'
 
 /** The gateway caps an individual history page at this size. */
 export const HISTORY_PAGE_SIZE = 500
@@ -91,6 +97,17 @@ function parseContent(value: unknown, label: string): SessionMessage['content'] 
   })
 }
 
+function parseInterimMessages(value: unknown, label: string): SessionInterimMessage[] {
+  const ids = new Set<string>()
+  return expectArray(value, label).map((item, index) => {
+    const row = expectRecord(item, `${label}[${index}]`)
+    const id = expectString(row.id, `${label}[${index}].id`)
+    if (!id || ids.has(id)) throw new ApiPayloadError(`${label}[${index}].id`)
+    ids.add(id)
+    return { id, text: expectString(row.text, `${label}[${index}].text`) }
+  })
+}
+
 function parseMessage(value: unknown, index: number): SessionMessage {
   const label = `session messages[${index}]`
   const row = expectRecord(value, label)
@@ -106,6 +123,11 @@ function parseMessage(value: unknown, index: number): SessionMessage {
     finish_reason: optionalString(row.finish_reason, `${label}.finish_reason`),
     reasoning: optionalString(row.reasoning, `${label}.reasoning`),
     reasoning_content: optionalString(row.reasoning_content, `${label}.reasoning_content`),
+    ...(row.interim_messages == null
+      ? {}
+      : {
+          interim_messages: parseInterimMessages(row.interim_messages, `${label}.interim_messages`),
+        }),
   }
 }
 

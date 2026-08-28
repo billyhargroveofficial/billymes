@@ -164,6 +164,24 @@ export function reconstructMessages(rows: SessionMessage[]): ChatMessage[] {
       const subagents = tools
         .map((t) => extractSubagent(t.name, t.args, t.result, t.id))
         .filter((s): s is NonNullable<typeof s> => Boolean(s))
+      // The API derives these from semantic Responses commentary phases, not
+      // from a text comparison. Keep them as independent durable segments so
+      // the presentation ledger can place hosted cards before the final row.
+      if (row.role === 'assistant') {
+        for (const interim of row.interim_messages ?? []) {
+          out.push({
+            localId: `h-${row.id}-interim-${interim.id}`,
+            role: 'assistant',
+            content: interim.text,
+            thinking: '',
+            tools: [],
+            todos: [],
+            subagents: [],
+            streaming: false,
+            ...(row.timestamp == null ? {} : { timestamp: row.timestamp }),
+          })
+        }
+      }
       out.push({
         localId: `h-${row.id}`,
         role: row.role === 'system' ? 'system' : 'assistant',

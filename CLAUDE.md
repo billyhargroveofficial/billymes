@@ -17,6 +17,12 @@ transcript rows are explicitly not an acceptable replacement.
 The WebUI reconciles this ledger at each terminal turn boundary. Keep live tool
 events as the fast path and the generation-guarded terminal read as recovery
 for a lost WebSocket lifecycle frame.
+Persisted Codex commentary is restored from a client-safe `interim_messages`
+projection of semantic `codex_message_items` phases. Keep raw Responses
+sidecars private (including `api_content`, `reasoning_details`, and `codex_*`),
+preserve profile visibility gates plus live redaction, and
+reconstruct stable commentary segments before hosted cards and final prose;
+never duplicate them as model-facing assistant rows or deduplicate by text.
 Do not pre-push a new local production commit to appease updater preflight: the
 updater itself verifies that the remote SHA is an exact ancestor, deploys the
 tested candidate, and publishes it only after service health passes.

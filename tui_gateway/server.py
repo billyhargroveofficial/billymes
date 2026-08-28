@@ -599,15 +599,27 @@ def _load_busy_input_mode() -> str:
 def _load_interim_assistant_messages() -> bool:
     """Return whether interim assistant commentary should be surfaced to UIs.
 
-    Honors ``display.interim_assistant_messages`` (default true). When false,
-    the tui_gateway does not install ``interim_assistant_callback``, so
-    interim text from tool-call turns and verify-on-stop candidates is never
-    emitted as ``message.interim`` — mirroring the messaging gateway's gating.
+    Honors ``display.interim_assistant_messages`` (default true). This is the
+    generic-provider callback gate; ``show_commentary`` is Codex-specific and
+    must not silence other providers' ordinary interim updates.
     """
     display = _load_cfg().get("display")
     if not isinstance(display, dict):
         return True
     return is_truthy_value(display.get("interim_assistant_messages", True))
+
+
+def _load_codex_interim_display_messages() -> bool:
+    """Return the durable Codex-sidecar display gate used on cold restore.
+
+    Codex commentary reaches the live callback only when both the generic
+    interim switch and Codex's ``show_commentary`` are enabled.  Keep this
+    separate from :func:`_load_interim_assistant_messages` so generic
+    providers retain their established callback semantics.
+    """
+    from agent.interim_display import interim_assistant_messages_enabled
+
+    return interim_assistant_messages_enabled(_load_cfg())
 
 
 def _notify_session_boundary(
@@ -9487,12 +9499,35 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
 
 
 def _history_to_messages(history: list[dict]) -> list[dict]:
+    from agent.interim_display import project_interim_assistant_messages
+
     messages = []
     tool_call_args = {}
 
+    def append_interim_messages(
+        interim_messages: list[dict[str, str]], *, timestamp: float | None = None
+    ) -> None:
+        """Append one display-only row per durable Codex commentary item."""
+        for interim in interim_messages:
+            interim_msg = {
+                "role": "assistant",
+                "text": interim["text"],
+                "display_kind": "interim_assistant",
+                "display_metadata": {"interim_id": interim["id"]},
+            }
+            if timestamp is not None:
+                interim_msg["timestamp"] = timestamp
+            messages.append(interim_msg)
+
+    show_interim_messages = _load_codex_interim_display_messages()
     for m in history:
         if not isinstance(m, dict):
             continue
+        # Keep the source sidecar private while restoring precisely the
+        # commentary that would have been emitted live before the final row.
+        interim_messages = project_interim_assistant_messages(
+            m, enabled=show_interim_messages
+        )
         m = project_compaction_message_for_display(m)
         if m is None:
             continue
@@ -9520,6 +9555,17 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
             if not content_text.strip():
+                # Hosted/Codex commentary often lives on this empty tool-call
+                # carrier. It must precede the following rendered tool row.
+                timestamp = m.get("timestamp")
+                append_interim_messages(
+                    interim_messages,
+                    timestamp=(
+                        float(timestamp)
+                        if isinstance(timestamp, (int, float)) and timestamp > 0
+                        else None
+                    ),
+                )
                 continue
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
@@ -9543,17 +9589,24 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # it vanish from the resumed/reloaded session view while the desktop's
         # reasoning disclosure has nothing to render. Keep it when it carries
         # reasoning so the "Thinking…" block still shows. (#44022)
-        reasoning_keys = (
-            "reasoning",
-            "reasoning_content",
-            "reasoning_details",
-            "codex_output_items",
-            "codex_reasoning_items",
-        )
+        # Only human-readable reasoning strings cross the display boundary.
+        # reasoning_details and codex_* are provider replay/signature state;
+        # treating them as display content both leaks internals and creates a
+        # blank assistant row for commentary-only hosted-tool carriers.
+        reasoning_keys = ("reasoning", "reasoning_content")
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        if not content_text.strip() and not has_reasoning:
+        has_interim = role == "assistant" and bool(interim_messages)
+        if not content_text.strip() and not has_reasoning and not has_interim:
+            continue
+        if (
+            role == "assistant"
+            and has_interim
+            and not content_text.strip()
+            and not has_reasoning
+        ):
+            append_interim_messages(interim_messages)
             continue
         msg = {"role": role, "text": content_text}
         # Persisted authoring time (Unix seconds) for display.timestamps
@@ -9588,6 +9641,10 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+        if role == "assistant":
+            append_interim_messages(
+                interim_messages, timestamp=msg.get("timestamp")
+            )
         messages.append(msg)
 
     return messages

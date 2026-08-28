@@ -51,6 +51,10 @@ Hermes services.
   tool messages or reissue calls while replaying. Live lifecycle events are the
   fast path; terminal-turn reconciliation repairs a missed WebSocket frame from
   the same durable ledger before a reload.
+- REST may attach safe `interim_messages` to the canonical assistant row. They
+  are semantic, redacted Codex commentary projections; reconstruct them as
+  stable assistant segments before the hosted-card segment and final prose.
+  Never consume raw Responses sidecars or infer duplicates from message text.
 - Transcript reload uses the gateway's dual-cursor protocol: `durable_seq`
   reports successful persistence and `replay_base_seq` marks the prefix safe
   to omit after hydration. Protected current replay and concurrently buffered

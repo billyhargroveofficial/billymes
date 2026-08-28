@@ -52,6 +52,49 @@ _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
 
 
+_CLIENT_MESSAGE_KEYS = frozenset(
+    {
+        "id",
+        "session_id",
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "tool_name",
+        "timestamp",
+        "token_count",
+        "finish_reason",
+        "reasoning",
+        "reasoning_content",
+        "display_kind",
+        "display_metadata",
+        "display_content",
+        "interim_messages",
+    }
+)
+
+
+def _client_message_projection(message: dict[str, Any]) -> dict[str, Any]:
+    """Allowlist one browser history row; provider replay state stays private."""
+    return {key: value for key, value in message.items() if key in _CLIENT_MESSAGE_KEYS}
+
+
+def _interim_messages_enabled_for_profile(profile: Optional[str]) -> bool:
+    """Resolve the exact profile gate used by the live commentary callback."""
+    from agent.interim_display import interim_assistant_messages_enabled
+    from hermes_cli.config import load_config_readonly
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    if not profile:
+        return interim_assistant_messages_enabled(load_config_readonly())
+    _, home = _cron_profile_home(profile)
+    token = set_hermes_home_override(str(home))
+    try:
+        return interim_assistant_messages_enabled(load_config_readonly())
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _compression_lineage_for_session(db, session_id: object) -> list[str]:
     """Return only the compression root-to-tip ids for one display row.
 
@@ -752,11 +795,26 @@ async def get_session_messages(
     sid, _limit, messages, user_turn_offset = result
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
+    from agent.interim_display import project_interim_assistant_messages
+
+    # This endpoint hydrates the same WebUI transcript as the API-server
+    # route.  Read one profile-scoped gate for the whole physical page; no
+    # synthetic rows are inserted, so pagination stays in SessionDB row units.
+    show_interim_messages = _interim_messages_enabled_for_profile(profile)
 
     projected_messages = []
     for message in messages:
         if not is_compaction_summary_message(message):
-            projected_messages.append(message)
+            projected = message.copy()
+            interims = project_interim_assistant_messages(
+                message, enabled=show_interim_messages
+            )
+            if interims:
+                projected["interim_messages"] = interims
+            # Start from SELECT * for the server-side semantic projection, but
+            # finish with an allowlist. In particular, api_content,
+            # reasoning_details, and every codex_* replay field stay private.
+            projected_messages.append(_client_message_projection(projected))
             continue
         display_view = project_compaction_message_for_display(message)
         projected = message.copy()
@@ -769,7 +827,12 @@ async def get_session_messages(
             # wrapper must not hide a successfully recovered live ask.
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
-        projected_messages.append(projected)
+        interims = project_interim_assistant_messages(
+            message, enabled=show_interim_messages
+        )
+        if interims and projected.get("display_kind") != "hidden":
+            projected["interim_messages"] = interims
+        projected_messages.append(_client_message_projection(projected))
     return {
         "session_id": sid,
         "messages": projected_messages,

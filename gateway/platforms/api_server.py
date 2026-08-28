@@ -4236,14 +4236,40 @@ class APIServerAdapter(BasePlatformAdapter):
             return {}
 
     @staticmethod
-    def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
+    def _message_response(
+        message: Dict[str, Any], *, include_interim_messages: bool = True
+    ) -> Dict[str, Any]:
+        # Extract before compaction projection removes provider-only sidecars.
+        # The returned field is deliberately reduced to id/text; clients must
+        # never receive the raw Responses replay payload.
+        from agent.interim_display import project_interim_assistant_messages
+
+        interim_messages = project_interim_assistant_messages(
+            message, enabled=include_interim_messages
+        )
         message = _project_client_message(message)
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content", "display_kind",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        response = {key: message.get(key) for key in safe_keys if key in message}
+        if interim_messages and response.get("display_kind") != "hidden":
+            response["interim_messages"] = interim_messages
+        return response
+
+    @staticmethod
+    def _interim_messages_enabled() -> bool:
+        """Read the profile-scoped display gate for durable REST hydration."""
+        try:
+            from agent.interim_display import interim_assistant_messages_enabled
+            from hermes_cli.config import load_config_readonly
+
+            return interim_assistant_messages_enabled(load_config_readonly())
+        except Exception:
+            # The live paths default on when config cannot be read; hydration
+            # must use the same fail-open default rather than hide durable text.
+            return True
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -4620,10 +4646,16 @@ class APIServerAdapter(BasePlatformAdapter):
             include_compacted=include_compacted,
             include_ancestors=include_compacted,
         )
+        include_interim_messages = self._interim_messages_enabled()
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [
+                self._message_response(
+                    m, include_interim_messages=include_interim_messages
+                )
+                for m in messages
+            ],
             "pagination": {
                 "limit": limit,
                 "offset": offset,
@@ -4939,7 +4971,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                turn_messages = (
+                    self._turn_transcript_messages(
+                        history,
+                        user_message,
+                        result,
+                        include_interim_messages=self._interim_messages_enabled(),
+                    )
+                    if isinstance(result, dict)
+                    else []
+                )
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
@@ -7130,6 +7171,8 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
         result: Dict[str, Any],
+        *,
+        include_interim_messages: bool = True,
     ) -> List[Dict[str, Any]]:
         """Return this turn's assistant/tool messages in client-safe shape.
 
@@ -7163,7 +7206,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # marks pure handoffs display_kind == "hidden"; classifying here
             # first would re-run the content classifier (a full content
             # flatten + prefix scan) a second time per message.
-            projected = cls._message_response(msg)
+            projected = cls._message_response(
+                msg, include_interim_messages=include_interim_messages
+            )
             if projected.get("display_kind") == "hidden":
                 continue
             out.append(projected)

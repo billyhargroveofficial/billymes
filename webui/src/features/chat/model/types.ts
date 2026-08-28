@@ -54,6 +54,12 @@ export type SessionRuntime = {
 
 export type SessionContentPart = string | Record<string, unknown>
 
+/** Durable semantic commentary projected from a canonical assistant response. */
+export type SessionInterimMessage = {
+  id: string
+  text: string
+}
+
 export type SessionMessage = {
   id: number
   session_id: string
@@ -66,6 +72,12 @@ export type SessionMessage = {
   finish_reason: string | null
   reasoning: string | null
   reasoning_content: string | null
+  /**
+   * Optional display projection of Responses commentary. The canonical row
+   * remains the final assistant response; these segments render immediately
+   * before it on a cold history load.
+   */
+  interim_messages?: SessionInterimMessage[]
 }
 
 export type ToolCallRaw = {

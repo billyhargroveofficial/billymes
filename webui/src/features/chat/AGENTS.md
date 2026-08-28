@@ -83,6 +83,10 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
 - `session.presentation.list` is display-only and bounded to 256 cards. A
   provider batch remains several cards with stable order and non-zero provider
   durations, while the transcript keeps zero synthetic function/tool rows.
+- REST history may carry `interim_messages` on a canonical assistant row. They
+  are server-derived semantic commentary segments (never text heuristics) and
+  reconstruct immediately before that row's final content, so the durable
+  order stays commentary → hosted cards → final after F5.
 - Live `tool.start`/`tool.complete` events are the fast path. Every terminal
   `message.complete`, `turn.end`, or `error` also performs a generation-guarded
   ledger reconciliation so one lost WebSocket lifecycle frame repairs itself

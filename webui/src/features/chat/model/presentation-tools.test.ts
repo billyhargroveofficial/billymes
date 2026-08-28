@@ -5,7 +5,8 @@ import {
   refreshesPresentationLedger,
   runPresentationTerminalReconciliation,
 } from './presentation-tools'
-import type { ChatMessage } from './types'
+import { reconstructMessages } from './chat-history'
+import type { ChatMessage, SessionMessage } from './types'
 
 const message = (role: ChatMessage['role'], localId: string): ChatMessage => ({
   localId,
@@ -327,6 +328,50 @@ describe('durable hosted presentation projection', () => {
     expect(result.messages[1]?.tools).toEqual([])
     expect(result.messages[2]?.tools).toMatchObject([{ id: 'hosted-search' }])
     expect(result.messages[3]?.tools).toEqual([])
+  })
+
+  it('restores commentary, hosted cards, and final content in order on a cold reload', () => {
+    const rows: SessionMessage[] = [
+      {
+        id: 1,
+        session_id: 'session-1',
+        role: 'user',
+        content: 'find sources',
+        tool_call_id: null,
+        tool_calls: null,
+        tool_name: null,
+        timestamp: 1,
+        finish_reason: null,
+        reasoning: null,
+        reasoning_content: null,
+      },
+      {
+        id: 2,
+        session_id: 'session-1',
+        role: 'assistant',
+        content: 'final answer',
+        tool_call_id: null,
+        tool_calls: null,
+        tool_name: null,
+        timestamp: 2,
+        finish_reason: 'stop',
+        reasoning: null,
+        reasoning_content: null,
+        interim_messages: [{ id: 'commentary-1', text: 'checking sources first' }],
+      },
+    ]
+
+    const result = mergePresentationIntoMessages(reconstructMessages(rows), [
+      hostedCard('hosted-search-1', 1),
+    ])
+
+    expect(result.messages.map((row) => [row.localId, row.content])).toEqual([
+      ['h-1', 'find sources'],
+      ['h-2-interim-commentary-1', 'checking sources first'],
+      ['presentation-turn-turn-1', ''],
+      ['h-2', 'final answer'],
+    ])
+    expect(result.messages[2]?.tools.map((tool) => tool.id)).toEqual(['hosted-search-1'])
   })
 
   it('puts a running cold-replayed card after the only interim segment', () => {

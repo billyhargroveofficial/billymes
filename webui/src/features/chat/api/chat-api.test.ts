@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ApiPayloadError } from '@/shared/api'
 import { chatApi } from './chat-api'
 
 afterEach(() => {
@@ -72,6 +73,74 @@ describe('chatApi session messages', () => {
       '/api/sessions/session-1/messages?include_compacted=true&order=latest&limit=500&offset=500&profile=work',
       expect.objectContaining({ credentials: 'include' }),
     )
+  })
+
+  it('accepts only the client-safe durable commentary projection', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              session_id: 'session-1',
+              messages: [
+                {
+                  id: 55,
+                  session_id: 'session-1',
+                  role: 'assistant',
+                  content: 'final',
+                  tool_call_id: null,
+                  tool_calls: null,
+                  tool_name: null,
+                  timestamp: null,
+                  finish_reason: 'stop',
+                  reasoning: null,
+                  reasoning_content: null,
+                  interim_messages: [{ id: 'commentary-1', text: 'checking sources' }],
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+      ),
+    )
+
+    await expect(chatApi.messages('session-1')).resolves.toMatchObject({
+      messages: [{ interim_messages: [{ id: 'commentary-1', text: 'checking sources' }] }],
+    })
+  })
+
+  it('rejects malformed durable commentary instead of guessing from provider sidecars', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              session_id: 'session-1',
+              messages: [
+                {
+                  id: 55,
+                  session_id: 'session-1',
+                  role: 'assistant',
+                  content: 'final',
+                  tool_call_id: null,
+                  tool_calls: null,
+                  tool_name: null,
+                  timestamp: null,
+                  finish_reason: 'stop',
+                  reasoning: null,
+                  reasoning_content: null,
+                  interim_messages: [{ id: 'commentary-1', text: 42 }],
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+      ),
+    )
+
+    await expect(chatApi.messages('session-1')).rejects.toBeInstanceOf(ApiPayloadError)
   })
 
   it('lists at least 100 sessions in recent-first order', async () => {

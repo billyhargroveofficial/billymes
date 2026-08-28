@@ -195,6 +195,68 @@ class TestTurnTranscriptProjection:
 
 class TestMessagesEndpointProjection:
     @pytest.mark.asyncio
+    async def test_messages_endpoint_projects_durable_commentary_without_raw_sidecars(
+        self,
+        adapter,
+        session_db,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(adapter, "_interim_messages_enabled", lambda: True)
+        session_id = session_db.create_session("commentary-projection", "api_server")
+        session_db.append_message(
+            session_id,
+            "assistant",
+            "FINAL BILLYMES",
+            codex_message_items=[
+                {
+                    "type": "message",
+                    "id": "commentary-1",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "PRELUDE BILLYMES"}],
+                },
+                {
+                    "type": "message",
+                    "id": "final-1",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "FINAL BILLYMES"}],
+                },
+            ],
+        )
+
+        async with TestClient(TestServer(_messages_app(adapter))) as client:
+            response = await client.get(f"/api/sessions/{session_id}/messages")
+            assert response.status == 200
+            payload = await response.json()
+
+        row = payload["data"][0]
+        assert row["content"] == "FINAL BILLYMES"
+        assert row["interim_messages"] == [
+            {"id": "commentary-1", "text": "PRELUDE BILLYMES"}
+        ]
+        assert "codex_message_items" not in row
+
+    def test_message_projection_respects_disabled_live_commentary_gate(self):
+        row = APIServerAdapter._message_response(
+            _row(
+                "assistant",
+                "final",
+                codex_message_items=[
+                    {
+                        "type": "message",
+                        "id": "commentary-1",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "prelude"}],
+                    }
+                ],
+            ),
+            include_interim_messages=False,
+        )
+        assert "interim_messages" not in row
+
+    @pytest.mark.asyncio
     async def test_messages_endpoint_never_serves_compaction_scaffolding(
         self,
         adapter,

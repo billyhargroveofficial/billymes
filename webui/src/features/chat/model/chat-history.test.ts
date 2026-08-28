@@ -69,6 +69,29 @@ describe('chat history reconstruction', () => {
     expect(messages[0]?.content).toBe('first block\nsecond block')
   })
 
+  it('places durable semantic commentary immediately before its canonical final row', () => {
+    const messages = reconstructMessages([
+      row({
+        id: 44,
+        content: 'final answer',
+        interim_messages: [{ id: 'commentary-1', text: 'checking sources first' }],
+      }),
+    ])
+
+    expect(messages.map((message) => [message.localId, message.content])).toEqual([
+      ['h-44-interim-commentary-1', 'checking sources first'],
+      ['h-44', 'final answer'],
+    ])
+  })
+
+  it('leaves canonical history unchanged when commentary projection is absent', () => {
+    const messages = reconstructMessages([row({ id: 44, content: 'final answer' })])
+
+    expect(messages.map((message) => [message.localId, message.content])).toEqual([
+      ['h-44', 'final answer'],
+    ])
+  })
+
   it('normalizes repeated todo ids from history tool results', () => {
     const messages = reconstructMessages([
       row({

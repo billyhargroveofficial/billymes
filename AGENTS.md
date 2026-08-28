@@ -182,6 +182,16 @@ Live lifecycle frames remain the fast path; each terminal turn event also
 performs a generation-guarded ledger reconciliation so a missed WebSocket
 frame repairs itself before reload without resubmitting the hosted operation.
 
+Codex commentary shares the canonical assistant response row as provider replay
+metadata (`codex_message_items` with `phase=commentary`); it must not become a
+second model-facing transcript row. Client history surfaces derive only the
+ordered, profile-gated `{id, text}` `interim_messages` display projection,
+apply the same think-block stripping and secret redaction as the live callback,
+and never expose raw provider replay fields such as `api_content`,
+`reasoning_details`, or any `codex_*` sidecar. The WebUI reconstructs those
+stable assistant segments before the canonical final row, allowing the hosted
+presentation segment to remain between commentary and final after F5.
+
 Compression is part of that identity boundary. Ledger reads and sidebar counts
 aggregate only the selected conversation's compression root-to-tip lineage;
 branch, delegate, reset, and tool children must never be included. The paged
@@ -212,9 +222,10 @@ The presentation ledger and its clients must:
 The main persistence surfaces are `tui_gateway/presentation_ledger.py`,
 `tui_gateway/server.py`, `tui_gateway/methods_session.py`, and
 `webui/src/features/chat/model/presentation-tools.ts`; the paged lineage
-contract also lives in `hermes_state.py` and both session HTTP adapters. Do not
-replace this design with fake function/tool transcript messages; that would
-regress the speed and semantics this fork exists to preserve.
+contract also lives in `hermes_state.py`, `agent/interim_display.py`, and both
+session HTTP adapters. Do not replace this design with fake function/tool or
+interim transcript messages; that would regress the speed and semantics this
+fork exists to preserve.
 
 ### Durable session-event recovery
 
