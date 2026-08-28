@@ -96,6 +96,31 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_web_extract_null_error_fields_are_success(self):
+        result = json.dumps({
+            "results": [{
+                "url": "https://example.com",
+                "title": "Example Domain",
+                "content": "ok",
+                "error": None,
+            }],
+        })
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_web_extract_nested_error_is_surfaced(self):
+        result = json.dumps({
+            "results": [{
+                "url": "https://example.com",
+                "title": "",
+                "content": "",
+                "error": "fetch timed out",
+            }],
+        })
+        assert _detect_tool_failure("web_extract", result) == (
+            True,
+            " [fetch timed out]",
+        )
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
@@ -118,4 +143,3 @@ class TestGetCuteToolMessageFailureSuffix:
         ok = json.dumps({"success": True, "data": "hi"})
         line = get_cute_tool_message("web_search", {"query": "hi"}, 0.2, result=ok)
         assert "[" not in line.split("0.2s", 1)[1]
-

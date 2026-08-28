@@ -1332,6 +1332,43 @@ def _trim_error(msg: str) -> str:
     return msg
 
 
+def _structured_failure_message(value: Any) -> str:
+    """Return the first explicit failure carried by parsed tool JSON.
+
+    Successful web extraction rows intentionally include ``"error": null``.
+    Scanning their serialized JSON for the substring ``"error"`` therefore
+    paints every successful fetch red.  Once a result parsed as JSON, inspect
+    semantic failure fields instead of falling back to substring heuristics.
+    """
+    if isinstance(value, list):
+        for item in value:
+            failure = _structured_failure_message(item)
+            if failure:
+                return failure
+        return ""
+    if not isinstance(value, dict):
+        return ""
+
+    error = value.get("error")
+    if error:
+        return str(error)
+
+    status = str(value.get("status") or "").strip().lower()
+    if status in {"error", "failed", "failure"}:
+        return str(value.get("message") or status)
+
+    if value.get("success") is False:
+        return str(value.get("message") or "failed")
+
+    for key in ("errors", "results"):
+        nested = value.get(key)
+        if isinstance(nested, list):
+            failure = _structured_failure_message(nested)
+            if failure:
+                return failure
+    return ""
+
+
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Inspect a tool result string for signs of failure.
 
@@ -1364,11 +1401,14 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
-    # Structured error in JSON result (any tool that surfaces {"error": ...}).
-    if isinstance(data, dict):
-        err = data.get("error") or data.get("message")
-        if err and (data.get("success") is False or "error" in data):
-            return True, f" [{_trim_error(str(err))}]"
+    # Parsed JSON has an explicit structure. Inspect semantic error fields and
+    # never scan its serialized spelling: successful web_extract rows contain
+    # ``"error": null`` by contract.
+    if isinstance(data, (dict, list)):
+        err = _structured_failure_message(data)
+        if err:
+            return True, f" [{_trim_error(err)}]"
+        return False, ""
 
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
