@@ -43,6 +43,12 @@ Use `scripts/billymes-update --check` to inspect upstream drift and
 7. only after the live deployment is healthy, mirrors `origin/main` and
    publishes `origin/billy/production` with exact `--force-with-lease` guards.
 
+An unpublished local production commit is accepted only as a strict
+fast-forward of the exact remote production SHA observed by preflight. The
+updater fetches that remote ref and verifies ancestry before validation and
+activation; a divergent, remote-only, or independently moved revision is still
+rejected. Do not pre-push a candidate to bypass this transaction boundary.
+
 Before local activation the updater writes a private receipt in the Git common
 directory. If interruption happens after activation but before both pushes
 finish, the next run revalidates the recorded revision, restores service
@@ -76,5 +82,6 @@ repository or copied runtime to synchronize. The production service executes
 that source tree and reads only its external `0600` environment file at
 `%h/billymes-ui/env`; the tracked unit template and updater are the integration
 contract. Keep hosted Responses calls presentation-only through the event
-ledger, including batch fan-out and reload replay. Never solve a UI reload by
-adding synthetic provider/tool messages to the Hermes transcript.
+ledger, including batch fan-out, terminal-turn reconciliation, and reload
+replay. Never solve a UI reload by adding synthetic provider/tool messages to
+the Hermes transcript.

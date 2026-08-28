@@ -48,7 +48,9 @@ Hermes services.
 - Do not create a nested Git repository or copy a separate WebUI history here.
 - Chat replay is presentation-ledger driven: grouped hosted calls remain hosted
   and are rendered as the original individual cards. Do not synthesize normal
-  tool messages or reissue calls while replaying.
+  tool messages or reissue calls while replaying. Live lifecycle events are the
+  fast path; terminal-turn reconciliation repairs a missed WebSocket frame from
+  the same durable ledger before a reload.
 
 See [`AGENTS.md`](AGENTS.md) for edit ownership and [`docs/README.md`](docs/README.md)
 for the design notes.

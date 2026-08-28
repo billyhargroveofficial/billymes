@@ -1,5 +1,120 @@
 import type { SessionPresentationCard } from './rpc-contracts'
 import type { ChatMessage, ToolCall } from './types'
+import type { GatewayEvent } from '@/features/gateway'
+
+/**
+ * Hosted Responses calls are persisted by the gateway before the turn ends.
+ * Re-read that durable projection at the terminal boundary so a missed
+ * lifecycle frame repairs itself before the user reloads the page.
+ */
+export function refreshesPresentationLedger(event: GatewayEvent) {
+  return event.type === 'message.complete' || event.type === 'turn.end' || event.type === 'error'
+}
+
+/**
+ * Coalesce terminal reconciliation by local turn, not merely by session. A
+ * repeated message.complete + turn.end for one turn cannot schedule a second
+ * read, while a newer turn that ends during a previous read gets one trailing
+ * reconciliation.
+ */
+export class PresentationTerminalReconciler {
+  private readonly states = new Map<
+    string,
+    {
+      generation: number
+      active: boolean
+      lastTerminalGeneration: number
+      inFlight: boolean
+      dirty: boolean
+    }
+  >()
+
+  markTurnSubmitted(sessionId: string) {
+    const state = this.state(sessionId)
+    state.generation += 1
+    state.active = true
+  }
+
+  markTurnActivity(sessionId: string) {
+    const state = this.state(sessionId)
+    // Resumed/auto turns do not have a local submit callback. Their first
+    // activity creates exactly one generation; later tool events do not.
+    if (!state.active) {
+      state.generation += 1
+      state.active = true
+    }
+  }
+
+  beginTerminal(sessionId: string) {
+    const state = this.state(sessionId)
+    // A terminal pair (`message.complete` then `turn.end`) arrives after the
+    // first terminal already made this generation inactive. Do not mistake
+    // that second frame for an implicit replay turn.
+    if (
+      !state.active &&
+      state.generation > 0 &&
+      state.lastTerminalGeneration === state.generation
+    ) {
+      return false
+    }
+    if (!state.active) this.markTurnActivity(sessionId)
+    if (state.lastTerminalGeneration === state.generation) return false
+    state.lastTerminalGeneration = state.generation
+    state.active = false
+    if (state.inFlight) {
+      state.dirty = true
+      return false
+    }
+    state.inFlight = true
+    return true
+  }
+
+  finish(sessionId: string) {
+    const state = this.states.get(sessionId)
+    if (!state) return false
+    if (state.dirty) {
+      state.dirty = false
+      // Keep the session reserved while the caller launches the trailing read,
+      // so duplicate terminal frames cannot race in a third request.
+      state.inFlight = true
+      return true
+    }
+    // Keep the last terminal generation so a delayed turn.end for the same
+    // completed turn remains a no-op after the request has settled.
+    state.inFlight = false
+    return false
+  }
+
+  private state(sessionId: string) {
+    let state = this.states.get(sessionId)
+    if (!state) {
+      state = {
+        generation: 0,
+        active: false,
+        lastTerminalGeneration: -1,
+        inFlight: false,
+        dirty: false,
+      }
+      this.states.set(sessionId, state)
+    }
+    return state
+  }
+}
+
+/** Start a terminal reconciliation and run its one required trailing read. */
+export function runPresentationTerminalReconciliation(
+  reconciler: PresentationTerminalReconciler,
+  sessionId: string,
+  load: () => Promise<unknown>,
+) {
+  if (!reconciler.beginTerminal(sessionId)) return
+  const refresh = () => {
+    void load().finally(() => {
+      if (reconciler.finish(sessionId)) refresh()
+    })
+  }
+  refresh()
+}
 
 /** Server-side hosted calls have no transcript rows; make them first-class activity cards. */
 function mergePresentationTools(

@@ -72,6 +72,10 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
 - `session.presentation.list` is display-only and bounded to 256 cards. A
   provider batch remains several cards with stable order and non-zero provider
   durations, while the transcript keeps zero synthetic function/tool rows.
+- Live `tool.start`/`tool.complete` events are the fast path. Every terminal
+  `message.complete`, `turn.end`, or `error` also performs a generation-guarded
+  ledger reconciliation so one lost WebSocket lifecycle frame repairs itself
+  before F5 without resubmitting the hosted call.
 - Reducer order is `interim commentary -> tools -> final`. A final response
   after an interim segment starts a fresh assistant segment; a cold replay must
   reproduce that same order and deduplicate cards already received live.

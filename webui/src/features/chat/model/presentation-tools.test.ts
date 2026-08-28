@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { mergePresentationIntoMessages } from './presentation-tools'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  mergePresentationIntoMessages,
+  PresentationTerminalReconciler,
+  refreshesPresentationLedger,
+  runPresentationTerminalReconciliation,
+} from './presentation-tools'
 import type { ChatMessage } from './types'
 
 const message = (role: ChatMessage['role'], localId: string): ChatMessage => ({
@@ -30,6 +35,106 @@ const hostedCard = (id: string, sequence: number, turnIndex = 1, turnId = 'turn-
 })
 
 describe('durable hosted presentation projection', () => {
+  it('reconciles a ledger-only hosted batch when the turn becomes terminal', () => {
+    expect(
+      refreshesPresentationLedger({
+        type: 'tool.complete',
+        payload: { tool_id: 'hosted_search_1', name: 'web_search' },
+      }),
+    ).toBe(false)
+    // The terminal fallback repairs a lost lifecycle before F5 without adding
+    // one ledger RPC for each card in a hosted batch.
+    expect(refreshesPresentationLedger({ type: 'message.complete' })).toBe(true)
+    expect(refreshesPresentationLedger({ type: 'turn.end' })).toBe(true)
+    expect(refreshesPresentationLedger({ type: 'error' })).toBe(true)
+
+    const user = message('user', 'user-1')
+    user.content = 'Search the web'
+    const commentary = message('assistant', 'commentary-1')
+    commentary.content = 'I will check that first.'
+    const final = message('assistant', 'final-1')
+    final.content = 'Here is the answer.'
+    const result = mergePresentationIntoMessages(
+      [user, commentary, final],
+      [hostedCard('hosted-search-1', 1)],
+    )
+
+    expect(result.messages.map((item) => item.content)).toEqual([
+      'Search the web',
+      'I will check that first.',
+      '',
+      'Here is the answer.',
+    ])
+    expect(result.messages[2]?.tools).toEqual([
+      expect.objectContaining({ id: 'hosted-search-1', status: 'done' }),
+    ])
+  })
+
+  it('deduplicates duplicate terminal events from one turn without a trailing read', () => {
+    const reconciler = new PresentationTerminalReconciler()
+
+    reconciler.markTurnSubmitted('session-1')
+    expect(reconciler.beginTerminal('session-1')).toBe(true)
+    expect(reconciler.beginTerminal('session-1')).toBe(false)
+    expect(reconciler.finish('session-1')).toBe(false)
+    // A repeated message.complete + turn.end must not set dirty for the same
+    // stable local turn generation.
+
+    reconciler.markTurnSubmitted('session-1')
+    expect(reconciler.beginTerminal('session-1')).toBe(true)
+    expect(reconciler.finish('session-1')).toBe(false)
+  })
+
+  it('runs one trailing reconciliation when a fast next turn ends in flight', () => {
+    const reconciler = new PresentationTerminalReconciler()
+
+    reconciler.markTurnSubmitted('session-1')
+    expect(reconciler.beginTerminal('session-1')).toBe(true)
+    // The next local submit creates a distinct generation before its terminal
+    // event arrives, so it is not mistaken for a duplicate turn.end.
+    reconciler.markTurnSubmitted('session-1')
+    expect(reconciler.beginTerminal('session-1')).toBe(false)
+    expect(reconciler.finish('session-1')).toBe(true)
+    expect(reconciler.finish('session-1')).toBe(false)
+  })
+
+  it('invokes no trailing load for duplicate terminal events but one for a fast next turn', async () => {
+    const reconciler = new PresentationTerminalReconciler()
+    let finishFirst: (() => void) | undefined
+    let finishTrailing: (() => void) | undefined
+    const load = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          if (!finishFirst) finishFirst = resolve
+          else finishTrailing = resolve
+        }),
+    )
+
+    reconciler.markTurnSubmitted('session-1')
+    runPresentationTerminalReconciliation(reconciler, 'session-1', load)
+    runPresentationTerminalReconciliation(reconciler, 'session-1', load)
+    expect(load).toHaveBeenCalledTimes(1)
+
+    finishFirst?.()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(load).toHaveBeenCalledTimes(1)
+
+    reconciler.markTurnSubmitted('session-1')
+    runPresentationTerminalReconciliation(reconciler, 'session-1', load)
+    expect(load).toHaveBeenCalledTimes(2)
+
+    // A separate next turn ends before this request settles: exactly one
+    // trailing request is started after the current ledger snapshot resolves.
+    reconciler.markTurnSubmitted('session-1')
+    runPresentationTerminalReconciliation(reconciler, 'session-1', load)
+    finishTrailing?.()
+    await Promise.resolve()
+    await Promise.resolve()
+    runPresentationTerminalReconciliation(reconciler, 'session-1', load)
+    expect(load).toHaveBeenCalledTimes(3)
+  })
+
   it('places cards into their own turn segment ordered by sequence', () => {
     const messages = [
       message('user', 'u1'),

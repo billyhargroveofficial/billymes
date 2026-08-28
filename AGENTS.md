@@ -43,6 +43,10 @@ publishing. The short version is:
   the rebase in an isolated worktree, installs locked dependencies, runs the
   owned regression gate, activates the tested branch, verifies new service
   PIDs and health, and only then performs guarded pushes.
+- Do not pre-push a new local production commit merely to satisfy preflight.
+  The updater accepts an unpublished candidate only when the exact observed
+  remote production SHA is its ancestor, then tests, deploys, health-checks,
+  and publishes it under the existing force-with-lease guard.
 - A failed staging rebase/test must leave the live checkout untouched. A
   failure after activation is recovered from the private Git receipt on the
   next updater run. Do not hand-delete that receipt or staging state without
@@ -156,6 +160,9 @@ display projection in the per-profile `presentation.db` sidecar and reloads it
 through `session.presentation.list`. The WebUI merges those cards by stable
 turn/card identity after REST history hydration and gateway resume/replay, so a
 cold page reload preserves the original commentary -> tools -> final order.
+Live lifecycle frames remain the fast path; each terminal turn event also
+performs a generation-guarded ledger reconciliation so a missed WebSocket
+frame repairs itself before reload without resubmitting the hosted operation.
 
 Compression is part of that identity boundary. Ledger reads and sidebar counts
 aggregate only the selected conversation's compression root-to-tip lineage;

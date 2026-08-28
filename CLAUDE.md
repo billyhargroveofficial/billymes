@@ -14,6 +14,12 @@ provider-hosted semantics described in the hosted-tool contract. Reload replay
 uses the per-profile `presentation.db` sidecar plus
 `session.presentation.list`; fake function calls or synthetic tool-result
 transcript rows are explicitly not an acceptable replacement.
+The WebUI reconciles this ledger at each terminal turn boundary. Keep live tool
+events as the fast path and the generation-guarded terminal read as recovery
+for a lost WebSocket lifecycle frame.
+Do not pre-push a new local production commit to appease updater preflight: the
+updater itself verifies that the remote SHA is an exact ancestor, deploys the
+tested candidate, and publishes it only after service health passes.
 
 For WebUI work, treat `webui/` as an in-tree package, not a separate checkout.
 Read `webui/AGENTS.md`; production source stays in this fork and only the

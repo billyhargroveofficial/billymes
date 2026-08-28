@@ -19,7 +19,12 @@ import {
   parseSessionUsageResult,
   type SessionPresentationCard,
 } from './rpc-contracts'
-import { mergePresentationIntoMessages } from './presentation-tools'
+import {
+  mergePresentationIntoMessages,
+  PresentationTerminalReconciler,
+  refreshesPresentationLedger,
+  runPresentationTerminalReconciliation,
+} from './presentation-tools'
 import { readSelectedSession, writeSelectedSession } from './session-selection'
 import { mergeUsage } from './session-utils'
 import { acceptGatewayEvent, replayEpochChanged } from './stream-recovery'
@@ -68,6 +73,8 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
   const historyHasEarlierRef = useRef(false)
   const historyPageLoading = useRef(false)
   const presentationCardsRef = useRef(new Map<string, readonly SessionPresentationCard[]>())
+  const presentationLoadGeneration = useRef(new Map<string, number>())
+  const terminalPresentationReconciler = useRef(new PresentationTerminalReconciler())
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
@@ -135,6 +142,19 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       return
     }
     setMessages((current) => applyGatewayEvent(current, event))
+    const storedSessionId = selectedRef.current.history
+    if (storedSessionId && (event.type === 'message.start' || event.type === 'tool.start')) {
+      terminalPresentationReconciler.current.markTurnActivity(storedSessionId)
+    }
+    if (storedSessionId && refreshesPresentationLedger(event)) {
+      // Reconcile once the turn is terminal: the live reducer is still the
+      // fast path, while the durable ledger repairs any missed WS lifecycle.
+      runPresentationTerminalReconciliation(
+        terminalPresentationReconciler.current,
+        storedSessionId,
+        () => loadPresentation(storedSessionId),
+      )
+    }
     if (event.type === 'message.start' || event.type === 'tool.start') {
       setBusy(true)
       setRuntime((previous) => ({
@@ -173,6 +193,8 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
   })
 
   async function loadPresentation(storedSessionId: string) {
+    const generation = (presentationLoadGeneration.current.get(storedSessionId) ?? 0) + 1
+    presentationLoadGeneration.current.set(storedSessionId, generation)
     try {
       const presentation = parseSessionPresentationListResult(
         await request('session.presentation.list', {
@@ -181,7 +203,12 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
           limit: 256,
         }),
       )
-      if (selectedRef.current.history !== storedSessionId) return
+      if (
+        selectedRef.current.history !== storedSessionId ||
+        presentationLoadGeneration.current.get(storedSessionId) !== generation
+      ) {
+        return
+      }
       presentationCardsRef.current.set(storedSessionId, presentation.cards)
       setMessages(
         (current) =>
@@ -376,6 +403,10 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
     setRuntime,
     setHistoryReady,
     makeSystemMessage: systemMessage,
+    markPresentationTurnSubmitted: () => {
+      const storedSessionId = selectedRef.current.history
+      if (storedSessionId) terminalPresentationReconciler.current.markTurnSubmitted(storedSessionId)
+    },
   })
 
   const value: ChatRuntimeContextValue = {

@@ -438,14 +438,28 @@ preflight_main() {
 
 preflight_production() {
     local trusted_local="$1" expected_production="$2"
-    local current_production trusted_sha
+    local current_production fetched_production trusted_sha origin_production_ref
     current_production="$(remote_branch_sha "$production_branch")"
     [[ "$current_production" == "$expected_production" ]] \
         || die "remote $production_branch moved during preflight"
     if [[ -n "$current_production" ]]; then
         trusted_sha="$(gitc rev-parse "$trusted_local")"
-        [[ "$current_production" == "$trusted_sha" ]] \
-            || die "remote $production_branch is not the trusted local production revision"
+        # A just-reviewed local fast-forward is safe to validate, activate and
+        # publish atomically: the fork still points at the exact SHA observed
+        # before staging, and that SHA is an ancestor of the local production
+        # candidate. Fetch the remote branch into a remote-tracking ref before
+        # asking Git about ancestry so this also works when its object was not
+        # already present locally. A divergent or remote-only commit fails
+        # this check and remains protected by the later force-with-lease push.
+        origin_production_ref="refs/remotes/$origin_remote/$production_branch"
+        gitc fetch "$origin_remote" \
+            "+refs/heads/$production_branch:$origin_production_ref"
+        fetched_production="$(gitc rev-parse "$origin_production_ref")"
+        [[ "$fetched_production" == "$current_production" \
+            && "$fetched_production" == "$expected_production" ]] \
+            || die "remote $production_branch moved while fetching preflight revision"
+        gitc merge-base --is-ancestor "$origin_production_ref" "$trusted_sha" \
+            || die "remote $production_branch is not an ancestor of trusted local production"
     fi
 }
 

@@ -66,6 +66,7 @@ type UseChatActionsOptions = {
   setRuntime: Dispatch<SetStateAction<SessionRuntime>>
   setHistoryReady: Dispatch<SetStateAction<boolean>>
   makeSystemMessage: (message: string) => ChatMessage
+  markPresentationTurnSubmitted: () => void
 }
 
 /** Command-side state transitions for the persistent chat controller. */
@@ -90,6 +91,7 @@ export function useChatActions({
   setRuntime,
   setHistoryReady,
   makeSystemMessage,
+  markPresentationTurnSubmitted,
 }: UseChatActionsOptions) {
   async function ensureSession(generation: number) {
     if (refs.selected.current.live) return refs.selected.current.live
@@ -122,6 +124,10 @@ export function useChatActions({
     try {
       const sessionId = await ensureSession(generation)
       if (!sessionId) return false
+      // The durable hosted-card recovery needs a stable client turn boundary.
+      // Do this before prompt.submit: an uncertain submit is still one turn
+      // and the following submit intentionally begins a new generation.
+      markPresentationTurnSubmitted()
       await request('prompt.submit', { session_id: sessionId, text })
       return true
     } catch (error) {
