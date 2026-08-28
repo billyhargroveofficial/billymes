@@ -19964,6 +19964,10 @@ BRANCH_CODEX_MESSAGE_ITEMS = [
         "content": [{"type": "output_text", "text": "done"}],
     }
 ]
+BRANCH_CODEX_OUTPUT_ITEMS = [
+    {"id": "ws_1", "type": "web_search_call", "status": "completed"},
+    *BRANCH_CODEX_MESSAGE_ITEMS,
+]
 
 
 def _branch_history():
@@ -19975,6 +19979,7 @@ def _branch_history():
             "reasoning": BRANCH_REASONING,
             "reasoning_content": BRANCH_REASONING_CONTENT,
             "reasoning_details": BRANCH_REASONING_DETAILS,
+            "codex_output_items": BRANCH_CODEX_OUTPUT_ITEMS,
             "codex_reasoning_items": BRANCH_CODEX_REASONING_ITEMS,
             "codex_message_items": BRANCH_CODEX_MESSAGE_ITEMS,
         },
@@ -20034,6 +20039,7 @@ def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
         assert assistant["reasoning"] == BRANCH_REASONING
         assert assistant["reasoning_content"] == BRANCH_REASONING_CONTENT
         assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+        assert assistant["codex_output_items"] == BRANCH_CODEX_OUTPUT_ITEMS
         assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
         assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
         marker = _branched_marker(db, "branch-key")
@@ -20081,6 +20087,7 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
         assert assistant["reasoning"] == BRANCH_REASONING
         assert assistant["reasoning_content"] == BRANCH_REASONING_CONTENT
         assert assistant["reasoning_details"] == BRANCH_REASONING_DETAILS
+        assert assistant["codex_output_items"] == BRANCH_CODEX_OUTPUT_ITEMS
         assert assistant["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
         assert assistant["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
         marker = _branched_marker(db, "branch-key")

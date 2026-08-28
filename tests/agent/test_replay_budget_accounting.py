@@ -7,9 +7,10 @@ convert time, Bedrock never replays thinking, strict chat-completions
 providers reject or one-space-pad the field. Charging them on every message
 spent 19-24% of the tail budget on bytes that never reach the wire.
 
-Codex sidecar fields (``codex_reasoning_items`` / ``codex_message_items``)
-ARE wire-replayed on every retained turn and stay charged unconditionally
-(#55572) — including native compaction checkpoints (#81747).
+Codex sidecar fields (the authoritative ``codex_output_items`` snapshot, or
+legacy ``codex_reasoning_items`` / ``codex_message_items``) ARE wire-replayed
+on every retained turn and stay charged unconditionally (#55572) — including
+native compaction checkpoints (#81747).
 """
 
 from agent.context_compressor import (
@@ -19,6 +20,7 @@ from agent.context_compressor import (
     _estimate_msg_budget_tokens,
     _last_assistant_index,
 )
+from agent.model_metadata import _wire_message_shadow
 
 
 BIG_THINKING = "deliberation " * 400  # ~1.3K tokens of stale thinking text
@@ -56,6 +58,35 @@ class TestChargeStaleThinking:
         )
         assert stale > bare + 500  # blob still charged on the stale path
 
+    def test_full_output_snapshot_is_charged_once_with_legacy_overlap(self):
+        output_items = [
+            *BIG_BLOB,
+            {
+                "type": "web_search_call",
+                "action": {"query": "x" * 2000},
+                "status": "completed",
+            },
+        ]
+        output_only = {
+            "role": "assistant",
+            "content": "done",
+            "codex_output_items": output_items,
+        }
+        migration_overlap = {
+            **output_only,
+            "codex_reasoning_items": BIG_BLOB,
+            "codex_message_items": [
+                {"type": "message", "content": [{"text": "x" * 1000}]}
+            ],
+        }
+        assert _estimate_msg_budget_tokens(
+            migration_overlap
+        ) == _estimate_msg_budget_tokens(output_only)
+        shadow = _wire_message_shadow(migration_overlap)
+        assert shadow["codex_output_items"] == output_items
+        assert "codex_reasoning_items" not in shadow
+        assert "codex_message_items" not in shadow
+
     def test_default_is_conservative_full_charge(self):
         msg = _assistant(thinking=True)
         assert _estimate_msg_budget_tokens(msg) == _estimate_msg_budget_tokens(
@@ -87,6 +118,7 @@ class TestKeyPartition:
         )
 
     def test_codex_fields_are_always_replayed_class(self):
+        assert "codex_output_items" in _ALWAYS_REPLAYED_BUDGET_KEYS
         assert "codex_reasoning_items" in _ALWAYS_REPLAYED_BUDGET_KEYS
         assert "codex_message_items" in _ALWAYS_REPLAYED_BUDGET_KEYS
 

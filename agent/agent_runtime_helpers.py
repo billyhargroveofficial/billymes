@@ -639,7 +639,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     # conversation_loop.py already de-dups identical codex interims).
     def _is_codex_interim(m: Dict) -> bool:
         return bool(
-            m.get("codex_reasoning_items")
+            m.get("codex_output_items")
+            or m.get("codex_reasoning_items")
             or m.get("codex_message_items")
             or m.get("finish_reason") == "incomplete"
         )
@@ -3761,7 +3762,11 @@ def _msg_has_payload(msg: Dict[str, Any]) -> bool:
     # pass has already run.  Treat them as payload so the repair never
     # rewrites a designed-empty codex turn (July 2026: a write-time pad that
     # ignored this broke codex commentary replay in CI).
-    if msg.get("codex_message_items") or msg.get("codex_reasoning_items"):
+    if (
+        msg.get("codex_output_items")
+        or msg.get("codex_message_items")
+        or msg.get("codex_reasoning_items")
+    ):
         return True
     return False
 

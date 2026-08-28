@@ -1038,6 +1038,18 @@ _HOSTED_RESPONSE_TOOL_TYPES = frozenset({
     "mcp_call",
 })
 
+_HOSTED_REQUEST_TOOL_TYPES = frozenset({
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "code_interpreter",
+    "image_generation",
+    "computer",
+    "local_shell",
+    "shell",
+    "mcp",
+})
+
 
 def _hosted_as_mapping(value: Any) -> dict[str, Any]:
     """Best-effort, shallow SDK/dict normalization without serializing blobs."""
@@ -1521,10 +1533,30 @@ def _raise_stream_error(event: Any) -> None:
     if raw_message is not None and not isinstance(raw_message, str):
         raw_message = str(raw_message)
     message = (raw_message or "stream emitted error event").strip() or "stream emitted error event"
+
+    raw_status = _error_field("status_code")
+    if raw_status is None:
+        raw_status = _error_field("status")
+    try:
+        status_code = int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    raw_headers = _error_field("headers")
+    headers: dict[str, Any] = {}
+    if isinstance(raw_headers, dict):
+        headers = dict(raw_headers)
+    elif raw_headers is not None and hasattr(raw_headers, "items"):
+        try:
+            headers = dict(raw_headers.items())
+        except Exception:
+            headers = {}
     raise _StreamErrorEvent(
         message,
         code=_error_field("code"),
         param=_error_field("param"),
+        status_code=status_code,
+        headers=headers,
     )
 
 
@@ -2153,21 +2185,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
-    def _on_text_delta(text: str) -> None:
-        agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
-
-    def _on_reasoning_delta(text: str) -> None:
-        agent._fire_reasoning_delta(text)
-
-    def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
-
-    def _on_event(event: Any) -> None:
-        # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
-        agent._touch_activity("receiving stream response")
-
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -2175,13 +2192,110 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         request_started_at = time.monotonic()
         intercepted_events = []
         writer_token = {"value": None}
+        # A transport retry is safe only until this physical attempt has
+        # published anything to the user. Retrying after a text/reasoning/
+        # commentary delta would append a second generation after the partial
+        # first one. Keep streaming latency by publishing immediately, but
+        # fail the attempt instead of replaying once publication has begun.
+        attempt_emitted_visible = {"value": False}
+        # A provider-hosted tool may have executed even when the transport
+        # drops before its first event. Once such a physical request is
+        # admitted, automatic replay is unsafe regardless of UI callbacks.
+        attempt_replay_unsafe = {"value": False}
+        def _declares_hosted_tool(request: Any) -> bool:
+            if not isinstance(request, dict):
+                return False
+            return any(
+                str(_item_field(tool, "type", "") or "")
+                in _HOSTED_REQUEST_TOOL_TYPES
+                for tool in (request.get("tools") or [])
+            )
+
+        request_declares_hosted_tool = _declares_hosted_tool(api_kwargs)
+
+        def _on_text_delta(text: str) -> None:
+            attempt_emitted_visible["value"] = True
+            attempt_replay_unsafe["value"] = True
+            agent._codex_streamed_text_parts.append(text)
+            agent._fire_stream_delta(text)
+
+        def _on_reasoning_delta(text: str) -> None:
+            attempt_emitted_visible["value"] = True
+            attempt_replay_unsafe["value"] = True
+            agent._fire_reasoning_delta(text)
+
+        def _on_commentary_message(text: str) -> None:
+            attempt_emitted_visible["value"] = True
+            attempt_replay_unsafe["value"] = True
+            agent._fire_streamed_codex_commentary(text)
+
+        def _on_event(event: Any) -> None:
+            # TTFB watchdog and activity touch — runs once per stream event.
+            agent._codex_stream_last_event_ts = time.time()
+            agent._touch_activity("receiving stream response")
+
+            # A hosted-tool frame means the provider may already have started
+            # side-effectful work.  This is a no-retry fence even in quiet or
+            # headless sessions where no progress callback/card is installed:
+            # replaying the physical request could execute the hosted call a
+            # second time.
+            event_type = str(_event_field(event, "type", "") or "")
+            item = _event_field(event, "item")
+            item_type = str(_item_field(item, "type", "") or "")
+            hosted_event = item_type in _HOSTED_RESPONSE_TOOL_TYPES or any(
+                marker in event_type
+                for marker in (
+                    "web_search_call",
+                    "file_search_call",
+                    "code_interpreter_call",
+                    "image_generation_call",
+                    "computer_call",
+                    "shell_call",
+                    "mcp_call",
+                )
+            )
+            if hosted_event:
+                attempt_replay_unsafe["value"] = True
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            if request_declares_hosted_tool or _declares_hosted_tool(next_api_kwargs):
+                # Set the fence before opening the transport. A connect/read
+                # failure can occur after the request bytes reached the
+                # provider but before Hermes receives its first SSE/WS frame;
+                # exactly-once hosted execution must fail closed there.
+                attempt_replay_unsafe["value"] = True
             stream_kwargs = _sanitize_consumer_codex_request(
                 agent,
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
+            # Consumer Codex has a provider-native persistent WebSocket wire.
+            # It is optional and self-falling-back: unsupported requests,
+            # handshake failures, and a single retry after a mid-stream socket
+            # failure all continue through the proven HTTP/SSE SDK path.
+            from agent import codex_websocket as _codex_websocket
+
+            prepared = _codex_websocket.prepare_codex_direct_request(
+                agent,
+                stream_kwargs,
+                active_client,
+            )
+            if prepared is not None:
+                websocket_stream = _codex_websocket.open_codex_websocket_stream(
+                    agent, prepared
+                )
+                if websocket_stream is not None:
+                    return websocket_stream
+                fallback_builder = getattr(
+                    _codex_websocket,
+                    "codex_http_fallback_kwargs",
+                    None,
+                )
+                stream_kwargs = (
+                    fallback_builder(agent, prepared)
+                    if callable(fallback_builder)
+                    else dict(prepared.http_kwargs)
+                )
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
             return active_client.responses.create(**stream_kwargs)
 
@@ -2243,7 +2357,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
-            if attempt < max_stream_retries:
+            if (
+                attempt < max_stream_retries
+                and getattr(exc, "retryable", True)
+                and not attempt_replay_unsafe["value"]
+            ):
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
                     "retrying. %s error=%s",
@@ -2253,6 +2371,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                 )
                 continue
+            if attempt_replay_unsafe["value"]:
+                logger.warning(
+                    "Codex Responses stream open failed after a hosted-tool "
+                    "request may have reached the provider; refusing an "
+                    "automatic replay. %s error=%s",
+                    agent._client_log_context(),
+                    exc,
+                )
             _log_codex_request_failure(
                 agent,
                 exc,
@@ -2292,7 +2418,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-                if attempt < max_stream_retries:
+                if (
+                    attempt < max_stream_retries
+                    and getattr(exc, "retryable", True)
+                    and not attempt_replay_unsafe["value"]
+                ):
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
                         "(attempt %s/%s); retrying. %s error=%s",
@@ -2300,6 +2430,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
                     continue
+                if attempt_replay_unsafe["value"]:
+                    logger.warning(
+                        "Codex Responses stream transport failed after visible "
+                        "output or potentially-started hosted work; refusing "
+                        "an automatic replay to avoid duplicate text/tool side "
+                        "effects. %s error=%s",
+                        agent._client_log_context(),
+                        exc,
+                    )
                 _log_codex_request_failure(
                     agent,
                     exc,

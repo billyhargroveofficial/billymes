@@ -1393,6 +1393,8 @@ def _prepare_resume_pending_message(
 #     continuity across turns.
 #   * ``codex_reasoning_items``: encrypted reasoning blobs for the OpenAI
 #     Codex Responses API.
+#   * ``codex_output_items``: complete ordered Responses output, including
+#     hosted tool calls, required for store=false manual-history replay.
 #   * ``codex_message_items``: exact assistant message items with ``phase``.
 #     OpenAI docs: "preserve and resend phase on all assistant messages —
 #     dropping it can degrade performance."  Required for prefix cache hits.
@@ -1402,6 +1404,7 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "reasoning",
     "reasoning_content",
     "reasoning_details",
+    "codex_output_items",
     "codex_reasoning_items",
     "codex_message_items",
     "finish_reason",

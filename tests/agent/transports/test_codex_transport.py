@@ -613,17 +613,22 @@ class TestCodexBuildKwargs:
         headers = kw["extra_headers"]
 
         assert headers["x-test"] == "1"
-        # session_id header carries the raw physical id untouched regardless
-        # of length (#57012); x-client-request-id mirrors the body's
-        # effective (already-bounded) prompt_cache_key.
+        # Conversation identity remains the raw physical id regardless of
+        # length; cache bucketing stays separate in prompt_cache_key.
         assert headers["session_id"] == session_id
-        assert headers["x-client-request-id"] == kw["prompt_cache_key"]
-        assert len(headers["x-client-request-id"]) <= 64
+        assert headers["session-id"] == session_id
+        assert headers["thread-id"] == session_id
+        assert headers["x-client-request-id"] == session_id
+        assert headers["x-codex-routing-hint"] == "model=gpt-5.4"
+        assert len(kw["prompt_cache_key"]) <= 64
 
     def test_codex_cache_scope_headers_normalize_cron_session_id(self, transport):
-        """x-client-request-id shares a cache scope across cron re-fires of the
-        same job (cron per-fire timestamp stripped, same as prompt_cache_key),
-        while session_id stays the raw per-fire physical id (#57012)."""
+        """Cron cache identity and conversation identity stay independent.
+
+        ``prompt_cache_key`` strips the per-fire timestamp; native Codex
+        session/thread headers retain it so separate executions cannot join a
+        continuation chain by accident.
+        """
         first_run = transport.build_kwargs(
             model="gpt-5.4",
             messages=[{"role": "user", "content": "Hi"}],
@@ -648,9 +653,9 @@ class TestCodexBuildKwargs:
 
         assert first_run["session_id"] == "cron_job42_20260801_090000"
         assert second_run["session_id"] == "cron_job42_20260802_090000"
-        assert first_run["x-client-request-id"].startswith("pck_")
-        assert first_run["x-client-request-id"] == second_run["x-client-request-id"]
-        assert first_run["x-client-request-id"] != other_job["x-client-request-id"]
+        assert first_run["x-client-request-id"] == "cron_job42_20260801_090000"
+        assert second_run["x-client-request-id"] == "cron_job42_20260802_090000"
+        assert other_job["x-client-request-id"] == "cron_job99_20260801_090000"
 
     def test_codex_profile_cache_scope_reuses_static_prefix_across_new_sessions(
         self, transport, monkeypatch
@@ -677,10 +682,8 @@ class TestCodexBuildKwargs:
             is_codex_backend=True,
         )
         assert first["prompt_cache_key"] == second["prompt_cache_key"]
-        assert (
-            first["extra_headers"]["x-client-request-id"]
-            == second["extra_headers"]["x-client-request-id"]
-        )
+        assert first["extra_headers"]["x-client-request-id"] == "session_one"
+        assert second["extra_headers"]["x-client-request-id"] == "session_two"
         assert first["extra_headers"]["session_id"] == "session_one"
         assert second["extra_headers"]["session_id"] == "session_two"
 

@@ -5106,8 +5106,17 @@ def run_conversation(
                     and any(
                         isinstance(_m, dict)
                         and _m.get("role") == "assistant"
-                        and isinstance(_m.get("codex_reasoning_items"), list)
-                        and _m.get("codex_reasoning_items")
+                        and (
+                            (
+                                isinstance(_m.get("codex_reasoning_items"), list)
+                                and _m.get("codex_reasoning_items")
+                            )
+                            or any(
+                                isinstance(_item, dict)
+                                and _item.get("type") in {"reasoning", "compaction"}
+                                for _item in (_m.get("codex_output_items") or [])
+                            )
+                        )
                         for _m in messages
                     )
                 ):
@@ -6944,12 +6953,14 @@ def run_conversation(
                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 interim_has_content = bool((interim_msg.get("content") or "").strip())
                 interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
+                interim_has_codex_output_items = bool(interim_msg.get("codex_output_items"))
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
 
                 if (
                     interim_has_content
                     or interim_has_reasoning
+                    or interim_has_codex_output_items
                     or interim_has_codex_reasoning
                     or interim_has_codex_message_items
                 ):
@@ -6990,11 +7001,28 @@ def run_conversation(
                             "reasoning",
                             "reasoning_content",
                             "reasoning_details",
+                            "codex_output_items",
                             "codex_reasoning_items",
                             "codex_message_items",
                         ):
                             if _key in interim_msg:
-                                if _key == "codex_reasoning_items":
+                                if _key == "codex_output_items":
+                                    # A visible-duplicate continuation is
+                                    # collapsed into the previous transcript
+                                    # row, but store=false still requires every
+                                    # output item from both Responses calls on
+                                    # the next manual replay.  Preserve their
+                                    # provider order instead of overwriting the
+                                    # earlier snapshot.
+                                    previous_items = last_msg.get(_key)
+                                    current_items = interim_msg[_key]
+                                    if isinstance(previous_items, list) and isinstance(
+                                        current_items, list
+                                    ):
+                                        last_msg[_key] = [*previous_items, *current_items]
+                                    else:
+                                        last_msg[_key] = current_items
+                                elif _key == "codex_reasoning_items":
                                     # Merge instead of overwrite: a native
                                     # compaction checkpoint captured on the
                                     # earlier incomplete response is the only
@@ -7025,6 +7053,7 @@ def run_conversation(
                     # explicitly asks for the final answer.
                     interim_replayable = (
                         interim_has_content
+                        or interim_has_codex_output_items
                         or interim_has_codex_reasoning
                         or interim_has_codex_message_items
                     )

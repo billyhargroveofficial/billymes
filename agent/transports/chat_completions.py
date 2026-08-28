@@ -267,8 +267,8 @@ class ChatCompletionsTransport(ProviderTransport):
         that strict chat-completions providers reject with HTTP 400/422
         (or, in the case of some OpenAI-compatible gateways, 5xx):
 
-        - Codex Responses API fields: ``codex_reasoning_items`` /
-          ``codex_message_items`` on the message, ``call_id`` /
+        - Codex Responses API fields: ``codex_output_items`` /
+          ``codex_reasoning_items`` / ``codex_message_items`` on the message, ``call_id`` /
           ``response_item_id`` on ``tool_calls`` entries.
         - ``extra_content`` on ``tool_calls`` (Gemini thought_signature) —
           stripped unless the outgoing ``model`` is itself Gemini-family.
@@ -304,7 +304,8 @@ class ChatCompletionsTransport(ProviderTransport):
             if not isinstance(msg, dict):
                 continue
             if (
-                "codex_reasoning_items" in msg
+                "codex_output_items" in msg
+                or "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
@@ -375,7 +376,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 return copied_msg
 
             if (
-                "codex_reasoning_items" in msg
+                "codex_output_items" in msg
+                or "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
@@ -383,6 +385,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "api_content" in msg  # persist-what-you-send sidecar
             ):
                 out_msg = mutable_msg()
+                out_msg.pop("codex_output_items", None)
                 out_msg.pop("codex_reasoning_items", None)
                 out_msg.pop("codex_message_items", None)
                 out_msg.pop("tool_name", None)

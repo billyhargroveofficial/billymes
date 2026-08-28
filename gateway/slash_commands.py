@@ -5257,6 +5257,7 @@ class GatewaySlashCommandsMixin:
                         "reasoning": msg.get("reasoning"),
                         "reasoning_content": msg.get("reasoning_content"),
                         "reasoning_details": msg.get("reasoning_details"),
+                        "codex_output_items": msg.get("codex_output_items"),
                         "codex_reasoning_items": msg.get("codex_reasoning_items"),
                         "codex_message_items": msg.get("codex_message_items"),
                         # Keep the api_content sidecar so the branch's first turn

@@ -21,6 +21,23 @@ def _compaction():
     return {"type": "compaction", "encrypted_content": "checkpoint-blob"}
 
 
+def _hosted_call():
+    return {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "docs"},
+    }
+
+
+def _message_item():
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "answer"}],
+    }
+
+
 def test_prior_turn_reasoning_items_are_pruned():
     messages = [
         {"role": "user", "content": "turn 1"},
@@ -84,6 +101,42 @@ def test_native_compaction_checkpoints_survive_pruning():
     assert messages[1]["codex_reasoning_items"] == [_compaction()]
 
 
+def test_full_output_prunes_only_reasoning_and_preserves_ordered_hosted_history():
+    messages = [
+        {"role": "user", "content": "turn 1"},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "codex_output_items": [
+                _compaction(),
+                _reasoning("rs_a"),
+                _hosted_call(),
+                _message_item(),
+            ],
+            # Migration overlap must not double-count this one message.
+            "codex_reasoning_items": [_compaction(), _reasoning("rs_a")],
+        },
+        {"role": "user", "content": "turn 2"},
+        {
+            "role": "assistant",
+            "content": "a2",
+            "codex_output_items": [_reasoning("rs_active"), _message_item()],
+        },
+    ]
+
+    assert _prune_stale_reasoning_replay(messages) == 1
+    assert messages[1]["codex_output_items"] == [
+        _compaction(),
+        _hosted_call(),
+        _message_item(),
+    ]
+    assert messages[1]["codex_reasoning_items"] == [_compaction()]
+    assert messages[3]["codex_output_items"] == [
+        _reasoning("rs_active"),
+        _message_item(),
+    ]
+
+
 def test_checkpoint_only_sidecar_untouched_and_uncounted():
     messages = [
         {"role": "user", "content": "turn 1"},
@@ -127,6 +180,7 @@ def test_prune_keys_contract():
     NOT be in the prune set; the prune targets reasoning blobs only."""
     assert "codex_reasoning_items" in _STALE_REPLAY_PRUNE_KEYS
     assert "codex_message_items" not in _STALE_REPLAY_PRUNE_KEYS
+    assert "codex_output_items" not in _STALE_REPLAY_PRUNE_KEYS
 
 
 class TestInterimMergePreservesCheckpoints:

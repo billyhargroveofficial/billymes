@@ -401,12 +401,21 @@ class _StreamErrorEvent(Exception):
         code: Optional[str] = None,
         param: Optional[str] = None,
         status_code: Optional[int] = None,
+        headers: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
         self.param = param
         self.status_code = status_code
+        # Match the small part of the OpenAI SDK error contract consumed by
+        # retry/error classification.  In particular, Retry-After must survive
+        # a provider-native Responses ``type=error`` frame just as it does an
+        # HTTP 429 response.
+        self.response = SimpleNamespace(
+            status_code=status_code,
+            headers=dict(headers or {}),
+        )
         # OpenAI SDK-shaped body so _extract_api_error_context /
         # _summarize_api_error / classify_api_error all pick it up.
         self.body: Dict[str, Any] = {
@@ -1263,9 +1272,10 @@ class AIAgent:
         ``invalid_encrypted_content``.  Sets ``self._codex_reasoning_replay_enabled``
         to ``False`` (consumed by ``codex_responses_adapter._chat_messages_to_responses_input``
         and ``transports/codex.py`` to drop ``reasoning.encrypted_content``
-        from subsequent requests) and pops ``codex_reasoning_items`` from
-        every assistant message in ``messages`` so they cannot be replayed
-        again later in the session.
+        from subsequent requests) and removes encrypted reasoning/compaction
+        entries from both the authoritative ``codex_output_items`` snapshot
+        and legacy ``codex_reasoning_items`` sidecar so they cannot reappear
+        after a persisted session is resumed. Hosted/message items remain.
 
         Returns a small stats dict ``{"messages": int, "items": int}``
         counting what was stripped — purely for diagnostic logging.
@@ -1277,10 +1287,73 @@ class AIAgent:
         for msg in target_messages:
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
+            message_changed = False
+            output_items = msg.get("codex_output_items")
+            if isinstance(output_items, list) and output_items:
+                kept_output_items = [
+                    item
+                    for item in output_items
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("type") in {"reasoning", "compaction"}
+                    )
+                ]
+                removed_output_count = len(output_items) - len(kept_output_items)
+                if removed_output_count:
+                    stripped_items += removed_output_count
+                    message_changed = True
+                    if kept_output_items:
+                        msg["codex_output_items"] = kept_output_items
+                    else:
+                        msg.pop("codex_output_items", None)
             items = msg.pop("codex_reasoning_items", None)
             if isinstance(items, list) and items:
-                stripped_messages += 1
                 stripped_items += len(items)
+                message_changed = True
+            if message_changed:
+                stripped_messages += 1
+
+        # Hydrated messages are stamped ``_db_persisted`` and the normal
+        # append-only flush correctly skips them.  Persist this recovery as a
+        # targeted row rewrite; otherwise the rejected encrypted blobs return
+        # after the next process restart even though this retry succeeds.
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        durable_strip = getattr(session_db, "strip_codex_encrypted_replay", None)
+        if (
+            not getattr(self, "_persist_disabled", False)
+            and session_id
+            and callable(durable_strip)
+        ):
+            try:
+                durable_strip(
+                    session_id,
+                    compression_lock_holder=getattr(
+                        self,
+                        "_active_compression_lock_holder",
+                        None,
+                    ),
+                    turn_lease_holder=getattr(
+                        self,
+                        "_active_session_turn_lease_holder",
+                        None,
+                    ),
+                    turn_lease_ttl_seconds=getattr(
+                        self,
+                        "_active_session_turn_lease_ttl_seconds",
+                        300.0,
+                    )
+                    or 300.0,
+                )
+            except Exception as exc:
+                # The in-memory retry is still useful if persistence becomes
+                # unavailable mid-turn; SessionDB already exhausts its bounded
+                # lock retry before this warning.
+                logger.warning(
+                    "Failed to durably clear rejected Codex replay for session %s: %s",
+                    session_id,
+                    exc,
+                )
 
         self._codex_reasoning_replay_enabled = False
         return {"messages": stripped_messages, "items": stripped_items}
@@ -2366,6 +2439,7 @@ class AIAgent:
                     "reasoning": msg.get("reasoning"),
                     "reasoning_content": msg.get("reasoning_content"),
                     "reasoning_details": msg.get("reasoning_details"),
+                    "codex_output_items": msg.get("codex_output_items"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
@@ -4581,6 +4655,16 @@ class AIAgent:
         except Exception:
             pass
 
+        # Close the persistent direct Codex Responses websocket before the
+        # HTTP client is retired.  It is session-owned just like the cached
+        # request clients and must not survive an LRU/TTL eviction.
+        try:
+            from agent.codex_websocket import close_codex_websockets
+
+            close_codex_websockets(self, reason="cache-evict")
+        except Exception:
+            pass
+
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
         # cross-thread hard close of the shared client can release TLS FDs
@@ -4674,6 +4758,16 @@ class AIAgent:
                     child.close()
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+        # 5b. Close the persistent direct Codex Responses websocket.  The
+        # response-id continuation chain is connection-local, so clearing it
+        # here also prevents a later session from inheriting stale state.
+        try:
+            from agent.codex_websocket import close_codex_websockets
+
+            close_codex_websockets(self, reason="agent-close")
         except Exception:
             pass
 
@@ -4990,6 +5084,21 @@ class AIAgent:
 
         if has_compaction_checkpoint(msg.get("codex_reasoning_items")):
             return False
+        codex_output_items = msg.get("codex_output_items")
+        if isinstance(codex_output_items, list):
+            output_types = {
+                item.get("type")
+                for item in codex_output_items
+                if isinstance(item, dict)
+            }
+            if "compaction" in output_types:
+                return False
+            # Hosted calls and message items are real assistant output.  The
+            # full snapshot intentionally coexists with its legacy reasoning
+            # sidecar, so the latter must not make such a turn appear
+            # thinking-only when projecting to another transport.
+            if output_types - {None, "reasoning"}:
+                return False
         reasoning = msg.get("reasoning_content") or msg.get("reasoning")
         if isinstance(reasoning, str) and reasoning.strip():
             return True
@@ -5006,6 +5115,11 @@ class AIAgent:
             return any(
                 isinstance(item, dict) and item.get("type") == "reasoning"
                 for item in codex_items
+            )
+        if drop_codex_reasoning_items and isinstance(codex_output_items, list):
+            return any(
+                isinstance(item, dict) and item.get("type") == "reasoning"
+                for item in codex_output_items
             )
         return False
 

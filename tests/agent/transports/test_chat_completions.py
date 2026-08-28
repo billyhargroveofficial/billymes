@@ -102,9 +102,21 @@ class TestChatCompletionsBasic:
 
 
     def test_convert_messages_no_codex_leaks(self, transport):
-        msgs = [{"role": "user", "content": "hi"}]
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "hi",
+                "codex_output_items": [
+                    {"type": "web_search_call", "id": "ws_1"}
+                ],
+                "codex_reasoning_items": [{"type": "reasoning"}],
+                "codex_message_items": [{"type": "message"}],
+            }
+        ]
         result = transport.convert_messages(msgs)
-        assert result is msgs  # no copy needed
+        assert result is not msgs
+        assert result == [{"role": "assistant", "content": "hi"}]
+        assert "codex_output_items" in msgs[0]  # copy-on-write
 
 
 

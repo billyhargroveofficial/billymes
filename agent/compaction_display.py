@@ -16,6 +16,7 @@ _COMPACTION_INTERNAL_FIELDS = (
     "reasoning",
     "reasoning_content",
     "reasoning_details",
+    "codex_output_items",
     "codex_reasoning_items",
     "codex_message_items",
 )

@@ -762,6 +762,192 @@ class TestCodexStreamCallbacks:
         # 1 initial + 1 retry = 2 calls
         assert call_count["n"] == 2
 
+    def test_codex_midstream_drop_after_visible_delta_is_not_replayed(self):
+        """A retry after publishing text would duplicate the generation."""
+        from run_agent import AIAgent
+        import httpx
+
+        fired_deltas = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=fired_deltas.append,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        class _DroppingCreateStream:
+            def __iter__(self_inner):
+                yield SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta="only once",
+                )
+                raise httpx.RemoteProtocolError("peer dropped mid-response")
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _DroppingCreateStream()
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            agent._run_codex_stream({}, client=mock_client)
+
+        assert fired_deltas == ["only once"]
+        assert mock_client.responses.create.call_count == 1
+
+    def test_codex_midstream_drop_after_headless_hosted_tool_is_not_replayed(self):
+        """Hosted work is a no-retry fence even without progress callbacks."""
+        from run_agent import AIAgent
+        import httpx
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+        assert agent.tool_progress_callback is None
+
+        class _DroppingHostedToolStream:
+            def __iter__(self_inner):
+                yield SimpleNamespace(
+                    type="response.output_item.added",
+                    item=SimpleNamespace(
+                        id="mcp_1",
+                        type="mcp_call",
+                        server_label="docs",
+                        name="search",
+                        arguments='{"q":"oauth"}',
+                    ),
+                )
+                raise httpx.RemoteProtocolError("peer dropped after hosted call")
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _DroppingHostedToolStream()
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            agent._run_codex_stream({}, client=mock_client)
+
+        assert mock_client.responses.create.call_count == 1
+
+    def test_codex_drop_before_first_hosted_tool_event_is_not_replayed(self):
+        """A declared hosted tool may run before its first event is received."""
+        from run_agent import AIAgent
+        import httpx
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        class _DropBeforeFirstFrame:
+            def __iter__(self_inner):
+                raise httpx.RemoteProtocolError("peer dropped before first event")
+                yield  # pragma: no cover - keeps this an iterator
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _DropBeforeFirstFrame()
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            agent._run_codex_stream(
+                {
+                    "tools": [
+                        {
+                            "type": "mcp",
+                            "server_label": "mutating-server",
+                            "server_url": "https://mcp.example.test",
+                        }
+                    ]
+                },
+                client=mock_client,
+            )
+
+        assert mock_client.responses.create.call_count == 1
+
+    def test_codex_hosted_tool_open_read_timeout_is_not_replayed(self):
+        """A timeout awaiting headers is ambiguous after request transmission."""
+        from run_agent import AIAgent
+        import httpx
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        mock_client = MagicMock()
+        mock_client.responses.create.side_effect = httpx.ReadTimeout(
+            "timed out waiting for first response byte"
+        )
+
+        with pytest.raises(httpx.ReadTimeout):
+            agent._run_codex_stream(
+                {"tools": [{"type": "web_search"}]},
+                client=mock_client,
+            )
+
+        assert mock_client.responses.create.call_count == 1
+
+    def test_codex_watchdog_abort_marker_is_not_retried_inside_worker(self):
+        """The outer watchdog owns recovery after it deliberately closes WS."""
+        from run_agent import AIAgent
+
+        class _IntentionalAbort(ConnectionError):
+            retryable = False
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        class _AbortedCreateStream:
+            def __iter__(self_inner):
+                raise _IntentionalAbort("closed by watchdog")
+                yield  # pragma: no cover - keeps this an iterator
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _AbortedCreateStream()
+
+        with pytest.raises(_IntentionalAbort):
+            agent._run_codex_stream({}, client=mock_client)
+
+        assert mock_client.responses.create.call_count == 1
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 

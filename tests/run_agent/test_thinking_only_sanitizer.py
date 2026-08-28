@@ -210,6 +210,9 @@ class TestCompactionCheckpointCarrier:
     def _carrier(self, items):
         return {"role": "assistant", "content": "", "codex_reasoning_items": list(items)}
 
+    def _output_carrier(self, items):
+        return {"role": "assistant", "content": "", "codex_output_items": list(items)}
+
     def test_reasoning_only_carrier_is_still_thinking_only(self):
         """The existing contract is unchanged for ordinary reasoning turns."""
         assert AIAgent._is_thinking_only_assistant(self._carrier([self.REASONING]))
@@ -221,6 +224,22 @@ class TestCompactionCheckpointCarrier:
     def test_checkpoint_order_does_not_matter(self):
         msg = self._carrier([self.CHECKPOINT, self.REASONING])
         assert not AIAgent._is_thinking_only_assistant(msg)
+
+    def test_full_output_reasoning_only_is_thinking_only(self):
+        assert AIAgent._is_thinking_only_assistant(
+            self._output_carrier([self.REASONING])
+        )
+
+    def test_full_output_checkpoint_is_not_thinking_only(self):
+        assert not AIAgent._is_thinking_only_assistant(
+            self._output_carrier([self.REASONING, self.CHECKPOINT])
+        )
+
+    def test_hosted_output_is_real_payload_not_thinking_only(self):
+        hosted = {"type": "web_search_call", "id": "ws_1"}
+        assert not AIAgent._is_thinking_only_assistant(
+            self._output_carrier([self.REASONING, hosted])
+        )
 
     def test_checkpoint_survives_the_sanitizer_pass(self):
         msgs = [

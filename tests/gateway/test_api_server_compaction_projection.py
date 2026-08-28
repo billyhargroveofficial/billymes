@@ -81,6 +81,7 @@ class TestMessageProjection:
                 reasoning="internal compression reasoning",
                 reasoning_content="internal compression reasoning",
                 reasoning_details=[{"type": "reasoning.summary", "summary": "internal"}],
+                codex_output_items=[{"type": "web_search_call", "id": "internal"}],
                 codex_reasoning_items=[{"type": "reasoning", "id": "internal"}],
                 codex_message_items=[{"type": "message", "id": "internal"}],
             )
@@ -93,6 +94,7 @@ class TestMessageProjection:
         assert "reasoning" not in projected
         assert "reasoning_content" not in projected
         assert "reasoning_details" not in projected
+        assert "codex_output_items" not in projected
         assert "codex_reasoning_items" not in projected
         assert "codex_message_items" not in projected
 

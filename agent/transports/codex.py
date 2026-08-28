@@ -541,10 +541,10 @@ class ResponsesApiTransport(ProviderTransport):
             cache_scope_id: str | None — rotation-stable logical scope id
                 (compression-lineage root; see agent/prompt_cache_scope.py).
                 Preferred over session_id when deriving the prompt_cache_key
-                content hash and the xAI x-grok-conv-id header; the Codex
-                x-client-request-id header mirrors the resulting body key.
-                Keeps the cache warm across context-compression session
-                rotation (#79017)
+                content hash and the xAI x-grok-conv-id header. Codex keeps
+                x-client-request-id tied to the physical session identity while
+                this scope keeps the body cache key warm across
+                context-compression session rotation (#79017)
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -870,9 +870,12 @@ class ResponsesApiTransport(ProviderTransport):
             # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
             # to actual HTTP request headers (not body fields).  ``session_id``
             # carries the raw physical session id — transcript/identity, per
-            # the #57012 contract — while ``x-client-request-id`` mirrors the
-            # body's effective ``prompt_cache_key`` so header and body always
-            # agree on the same routing bucket instead of diverging (#78941).
+            # the #57012 contract. ``session-id`` / ``thread-id`` and
+            # ``x-client-request-id`` mirror the native codex-rs conversation
+            # identity. The cache bucket is
+            # deliberately separate in ``prompt_cache_key``: using it as a
+            # request/thread id conflates prefix caching with conversation
+            # affinity and prevents provider-native continuation reuse.
             final_cache_key = kwargs.get("prompt_cache_key") or _bounded_prompt_cache_key(_cache_scope)
             if session_id or final_cache_key:
                 existing_extra_headers = kwargs.get("extra_headers")
@@ -886,9 +889,20 @@ class ResponsesApiTransport(ProviderTransport):
                         }
                     )
                 if session_id:
+                    # Keep the legacy underscore spelling for compatibility
+                    # with older consumer-Codex deployments, while emitting
+                    # the canonical current headers used by codex-rs.
                     merged_extra_headers["session_id"] = str(session_id)
-                if final_cache_key:
+                    merged_extra_headers["session-id"] = str(session_id)
+                    merged_extra_headers["thread-id"] = str(session_id)
+                    merged_extra_headers["x-client-request-id"] = str(session_id)
+                elif final_cache_key:
                     merged_extra_headers["x-client-request-id"] = final_cache_key
+                routing_hint = f"model={kwargs.get('model', model)}"
+                service_tier = kwargs.get("service_tier")
+                if service_tier:
+                    routing_hint += f";tier={service_tier}"
+                merged_extra_headers["x-codex-routing-hint"] = routing_hint
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
@@ -984,6 +998,12 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
         if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
             provider_data["codex_message_items"] = msg.codex_message_items
+        if msg and hasattr(msg, "codex_output_items") and msg.codex_output_items:
+            # Complete ordered response.output snapshot.  Unlike the legacy
+            # reasoning/message sidecars this also carries provider-hosted
+            # calls (web/file search, image/code/shell/MCP/etc.) so store=false
+            # manual history can replay the turn without semantic holes.
+            provider_data["codex_output_items"] = msg.codex_output_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 

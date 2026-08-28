@@ -112,6 +112,53 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     assert "gpt-5-internal" not in models
 
 
+def test_picker_fetch_preserves_full_catalog_for_direct_oauth_runtime(monkeypatch):
+    """The slug-only picker API also seeds the account-scoped metadata cache."""
+    import sys
+    from agent import model_metadata
+    from hermes_cli import codex_models
+
+    monkeypatch.setattr(model_metadata, "_codex_oauth_context_cache", {})
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "priority": 1,
+                        "context_window": 272_000,
+                        "use_responses_lite": True,
+                        "prefer_websockets": True,
+                        "service_tiers": [{"name": "fast"}],
+                    }
+                ]
+            }
+
+    class _FakeHttpx:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            return _FakeResp()
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+
+    model_ids = codex_models._fetch_models_from_api(access_token="picker-token")
+    metadata = model_metadata.get_codex_oauth_model_metadata(
+        "gpt-5.6-terra",
+        access_token="picker-token",
+    )
+
+    assert "gpt-5.6-terra" in model_ids
+    assert metadata["prefer_websockets"] is True
+    assert metadata["service_tiers"] == [{"name": "fast"}]
+    assert model_metadata.should_use_codex_responses_lite(
+        "gpt-5.6-terra",
+        access_token="picker-token",
+    ) is True
+
+
 
 
 
@@ -238,4 +285,3 @@ class TestNormalizeModelForProvider:
         assert changed is True
         # Uses first from available list
         assert cli.model == "gpt-5.3-codex"
-

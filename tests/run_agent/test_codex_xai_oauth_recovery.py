@@ -151,6 +151,34 @@ def test_codex_stream_wire_error_event_nested_envelope_attr_style():
     assert excinfo.value.code == "rate_limit_exceeded"
 
 
+def test_codex_stream_wire_error_preserves_status_and_retry_headers():
+    """Native error frames retain the HTTP-like fields used by classifiers."""
+    from agent.codex_runtime import _raise_stream_error
+    from run_agent import _StreamErrorEvent
+
+    with pytest.raises(_StreamErrorEvent) as excinfo:
+        _raise_stream_error(
+            {
+                "type": "error",
+                "error": {
+                    "message": "Too many requests",
+                    "code": "rate_limit_exceeded",
+                    "status": "429",
+                    "headers": {
+                        "retry-after": "17",
+                        "x-request-id": "req-native-ws",
+                    },
+                },
+            }
+        )
+
+    exc = excinfo.value
+    assert exc.status_code == 429
+    assert exc.response.status_code == 429
+    assert exc.response.headers["retry-after"] == "17"
+    assert exc.response.headers["x-request-id"] == "req-native-ws"
+
+
 
 
 

@@ -70,6 +70,7 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.4")
 
     closes: list = []
+    native_ws_aborts: list[str] = []
     statuses: list[str] = []
     dummy_client = SimpleNamespace()
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
@@ -82,6 +83,11 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
         lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        h,
+        "_abort_codex_native_websocket",
+        lambda _agent, *, reason: native_ws_aborts.append(reason),
     )
 
     stop = {"flag": False}
@@ -102,6 +108,7 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
         assert "gpt-5.3-codex" in message
         assert "gpt-5.4-codex" in message
         assert "codex_ttfb_kill" in closes
+        assert native_ws_aborts == ["codex_ttfb_kill"]
         assert statuses, "expected a user-facing watchdog status"
         assert any("gpt-5.4" in s and "gpt-5.3-codex" in s for s in statuses)
     finally:
@@ -146,6 +153,104 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
+
+
+def test_default_event_watchdog_allows_13_second_max_reasoning_gap():
+    """A healthy Luna/max hidden-reasoning pause must outlive the old 12s kill.
+
+    The production failure happened around a 9.6k-token request: the backend
+    emitted an opening SSE event, reasoned silently for more than 12 seconds,
+    and Hermes force-closed it.  Exercise that exact threshold without making
+    the test suite sleep in real time.
+    """
+    from agent import chat_completion_helpers as h
+
+    timeout = h.openai_codex_event_stale_timeout(9_656, "max")
+    last_event = 100.0
+    thirteen_second_gap = 113.1
+
+    assert timeout == 180.0
+    assert thirteen_second_gap - last_event < timeout
+    # The total-call watchdog must be at least as patient, otherwise it would
+    # still kill the same healthy turn before the event-gap detector fires.
+    assert h.openai_codex_stale_timeout_floor(9_656, "max") >= timeout
+
+
+@pytest.mark.parametrize(
+    "tokens,effort,expected",
+    [
+        (1_000, "low", 60.0),
+        (1_000, "medium", 90.0),
+        (1_000, "high", 120.0),
+        (1_000, "xhigh", 180.0),
+        (1_000, "max", 180.0),
+        (60_000, "low", 120.0),
+        (120_000, "low", 180.0),
+    ],
+)
+def test_event_watchdog_scales_with_effort_and_context(tokens, effort, expected):
+    from agent.chat_completion_helpers import openai_codex_event_stale_timeout
+
+    assert openai_codex_event_stale_timeout(tokens, effort) == expected
+
+
+def test_codex_reasoning_effort_defaults_to_transport_medium():
+    from agent.chat_completion_helpers import _openai_codex_reasoning_effort
+
+    assert _openai_codex_reasoning_effort({}) == "medium"
+    assert _openai_codex_reasoning_effort({"reasoning": {"effort": "MAX"}}) == "max"
+    assert _openai_codex_reasoning_effort({"reasoning": {"effort": "bogus"}}) == "medium"
+
+
+def test_event_watchdog_still_reclaims_a_genuinely_stuck_stream(
+    tmp_path,
+    monkeypatch,
+):
+    """The safer default remains a finite, operator-tunable liveness check."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.4")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"flag": False}
+
+    def fake_stuck_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"]:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stuck_stream)
+
+    try:
+        with pytest.raises(TimeoutError, match="no SSE events"):
+            h.interruptible_api_call(
+                agent,
+                {
+                    "model": "gpt-5.6-luna",
+                    "input": "hi",
+                    "reasoning": {"effort": "max"},
+                },
+            )
+        assert "codex_stream_idle_kill" in closes
+    finally:
+        stop["flag"] = True
 
 
 
@@ -345,7 +450,4 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
-
-
 

@@ -514,7 +514,7 @@ class TestTailBudgetCodexReplayFields:
         """Tail protection must budget hidden replay fields sent back to providers.
 
         Codex Responses messages can have tiny visible content but large
-        `codex_reasoning_items`, `codex_message_items`, or provider-native
+        `codex_output_items`, `codex_reasoning_items`, `codex_message_items`, or provider-native
         reasoning fields. Preflight compression counts these fields, so the
         tail-cut budget must count them too; otherwise compression preserves an
         oversized tail and immediately starts the next session near the limit.
@@ -572,6 +572,15 @@ class TestTailBudgetCodexReplayFields:
             ("reasoning", "x" * 5_000),
             ("reasoning_content", "x" * 5_000),
             ("reasoning_details", [{"text": "x" * 5_000}]),
+            (
+                "codex_output_items",
+                [
+                    {
+                        "type": "web_search_call",
+                        "action": {"query": "x" * 5_000},
+                    }
+                ],
+            ),
             (
                 "codex_reasoning_items",
                 [{"type": "reasoning", "encrypted_content": "x" * 5_000}],
@@ -1707,6 +1716,85 @@ class TestCompressWithClient:
         assert len(first_tail) == 1
         assert "summary text" in first_tail[0]["content"]
 
+    def test_assistant_tail_merge_refreshes_authoritative_responses_snapshot(self):
+        """A merged summary must replace the assistant message replay item.
+
+        Responses replay treats ``codex_output_items`` as authoritative.  If
+        compaction only rewrites chat ``content``, the next request silently
+        replays the pre-compaction answer and loses the summary.
+        """
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "DURABLE_SUMMARY"
+
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=3,
+                protect_last_n=3,
+            )
+
+        tail_snapshot = [
+            {
+                "type": "web_search_call",
+                "id": "ws_preserved",
+                "status": "completed",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": "STALE_TAIL_ANSWER"}
+                ],
+            },
+        ]
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},  # last head: user
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {
+                "role": "assistant",  # tail starts assistant: double collision
+                "content": "LIVE_TAIL_ANSWER",
+                "codex_output_items": tail_snapshot,
+                "codex_message_items": [tail_snapshot[1]],
+            },
+            {"role": "user", "content": "msg 8"},
+            {"role": "assistant", "content": "msg 9"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        merged = next(m for m in result if m.get(COMPRESSED_SUMMARY_METADATA_KEY))
+        assert merged["role"] == "assistant"
+        assert "LIVE_TAIL_ANSWER" in merged["content"]
+        assert "DURABLE_SUMMARY" in merged["content"]
+        assert "STALE_TAIL_ANSWER" not in merged["content"]
+
+        replay = _chat_messages_to_responses_input(result)
+        assert any(item.get("id") == "ws_preserved" for item in replay)
+        replayed_text = "\n".join(
+            part.get("text", "")
+            for item in replay
+            if item.get("type") == "message" and item.get("role") == "assistant"
+            for part in item.get("content", [])
+            if isinstance(part, dict)
+        )
+        assert "LIVE_TAIL_ANSWER" in replayed_text
+        assert "DURABLE_SUMMARY" in replayed_text
+        assert "STALE_TAIL_ANSWER" not in replayed_text
+
 
     def test_merge_into_tail_end_marker_is_last(self):
         """Regression for #56372: in a merge-into-tail summary, the END MARKER
@@ -2583,6 +2671,57 @@ class TestSanitizerStripsOrphanedToolCalls:
         assert not any(m.get("role") == "tool" for m in sanitized)
         # Empty assistant should get placeholder content
         assert asst.get("content") == "(tool call removed)"
+
+    def test_sanitizer_removes_orphan_from_authoritative_responses_snapshot(
+        self,
+        compressor,
+    ):
+        """A stripped chat tool_call must not resurrect from exact replay."""
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fc_orphan",
+                        "call_id": "call_orphan",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+                "codex_output_items": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_orphan",
+                        "call_id": "call_orphan",
+                        "name": "search",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [],
+                    },
+                ],
+            },
+            {"role": "user", "content": "never mind"},
+        ]
+
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+        replay = _chat_messages_to_responses_input(sanitized)
+
+        assert not any(item.get("type") == "function_call" for item in replay)
+        assistant_item = next(
+            item
+            for item in replay
+            if item.get("type") == "message" and item.get("role") == "assistant"
+        )
+        assert assistant_item["content"] == [
+            {"type": "output_text", "text": "(tool call removed)"}
+        ]
 
     def test_sanitizer_strips_orphaned_keeps_valid(self, compressor):
         """When a MID-LIST assistant has both valid and orphaned tool_calls,

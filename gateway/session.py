@@ -3907,6 +3907,7 @@ class SessionStore:
             reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
             reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
             reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
+            codex_output_items=message.get("codex_output_items") if message.get("role") == "assistant" else None,
             codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
             codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),

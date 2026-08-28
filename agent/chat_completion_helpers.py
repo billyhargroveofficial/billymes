@@ -53,6 +53,12 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+_CODEX_NATIVE_ABORT_REASONS = frozenset({
+    "codex_ttfb_kill",
+    "codex_stream_idle_kill",
+    "stale_call_kill",
+    "interrupt_abort",
+})
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -64,6 +70,26 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+
+
+def _abort_codex_native_websocket(agent: Any, *, reason: str) -> None:
+    """Interrupt a direct OAuth Codex websocket alongside its HTTP client.
+
+    Codex Responses runs through the nominally non-streaming worker wrapper,
+    but its provider-native websocket is not owned by the request-local
+    OpenAI/httpx client. Closing only that client therefore cannot wake a
+    blocked websocket ``recv``. Keep this lazy and no-op for other runtimes.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return
+    try:
+        from agent.codex_websocket import abort_active_codex_websocket
+
+        abort_active_codex_websocket(agent, reason=reason)
+    except Exception:
+        logger.debug(
+            "Direct Codex websocket abort failed (%s)", reason, exc_info=True
+        )
 
 
 def _context_thread_target(callback):
@@ -518,7 +544,70 @@ def _is_openai_codex_backend(agent) -> bool:
     return classify_responses_route(agent).is_codex_backend
 
 
-def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
+def _openai_codex_reasoning_effort(api_kwargs: dict) -> str:
+    """Return the normalized Codex reasoning effort for watchdog tuning.
+
+    Responses requests carry the wire setting under ``reasoning.effort``.
+    Treat an omitted or malformed setting as ``medium``, matching the Codex
+    transport default, so watchdog behavior remains deterministic even for
+    callers that construct request dictionaries by hand.
+    """
+    reasoning = api_kwargs.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    normalized = str(effort or "medium").strip().lower()
+    if normalized not in {
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }:
+        return "medium"
+    return normalized
+
+
+def openai_codex_event_stale_timeout(
+    est_tokens: int,
+    reasoning_effort: str = "medium",
+) -> float:
+    """Default maximum gap between healthy Codex stream events.
+
+    Reasoning models may legitimately emit an opening Responses event and
+    then remain quiet while producing hidden reasoning.  A 12-second default
+    therefore caused healthy Luna ``max`` turns to be force-closed and fully
+    retried.  Keep a finite detector for truly wedged sockets, but give even
+    small requests at least one minute and scale patience with both prompt
+    size and requested reasoning effort.
+    """
+    if est_tokens > 100_000:
+        context_floor = 180.0
+    elif est_tokens > 50_000:
+        context_floor = 120.0
+    elif est_tokens > 10_000:
+        context_floor = 90.0
+    else:
+        context_floor = 60.0
+
+    effort_floor = {
+        "none": 60.0,
+        "minimal": 60.0,
+        "low": 60.0,
+        "medium": 90.0,
+        "high": 120.0,
+        "xhigh": 180.0,
+        "max": 180.0,
+        "ultra": 180.0,
+    }.get(str(reasoning_effort or "medium").strip().lower(), 90.0)
+    return max(context_floor, effort_floor)
+
+
+def openai_codex_stale_timeout_floor(
+    est_tokens: int,
+    reasoning_effort: str | None = None,
+) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context.
 
     Gateway/Telegram sessions routinely ship ~15–25k tokens of tools +
@@ -526,15 +615,30 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     legitimately spend several minutes in backend admission/prefill at that
     size; the generic 90s non-stream stale default aborts healthy calls. The
     floor engages above 10k estimated tokens so those gateway-scale payloads
-    are covered; smaller requests keep the generic default.
+    are covered. When ``reasoning_effort`` is supplied, even a smaller request
+    gets enough total wall-clock budget to reach its effort-aware event-idle
+    deadline; the omitted-effort form preserves the legacy context-only API.
     """
     if est_tokens > 100_000:
-        return 1200.0
-    if est_tokens > 50_000:
-        return 900.0
-    if est_tokens > 10_000:
-        return 600.0
-    return 0.0
+        context_floor = 1200.0
+    elif est_tokens > 50_000:
+        context_floor = 900.0
+    elif est_tokens > 10_000:
+        context_floor = 600.0
+    else:
+        context_floor = 0.0
+
+    if reasoning_effort is None:
+        return context_floor
+
+    # The wall-clock detector must not fire before the event-idle detector.
+    # This matters for small high/max reasoning turns: without this floor the
+    # generic 90s call timeout would still abort a legitimate 120–180s hidden
+    # reasoning phase even after fixing the event-gap threshold itself.
+    return max(
+        context_floor,
+        openai_codex_event_stale_timeout(est_tokens, reasoning_effort),
+    )
 
 
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
@@ -1170,6 +1274,7 @@ def direct_api_call(agent, api_kwargs: dict):
                 # older timer restoring the streak afterwards.
                 _bump_stale_streak(agent)
             request_client = request_state["client"]
+            _abort_codex_native_websocket(agent, reason=reason)
             if request_client is not None:
                 try:
                     agent._abort_request_openai_client(request_client, reason=reason)
@@ -1381,6 +1486,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
         return client
 
     def _close_request_client_once(reason: str) -> None:
+        if reason in _CODEX_NATIVE_ABORT_REASONS:
+            _abort_codex_native_websocket(agent, reason=reason)
         # #29507: dispatch on the calling thread.
         #
         # When ``_call`` (the worker) reaches its ``finally`` it owns the
@@ -1496,8 +1603,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
+    _codex_reasoning_effort = _openai_codex_reasoning_effort(api_kwargs)
     if _codex_watchdog_enabled and _openai_codex_backend:
-        _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
+        _codex_floor = openai_codex_stale_timeout_floor(
+            _est_tokens_for_codex_watchdog,
+            _codex_reasoning_effort,
+        )
         if _codex_floor:
             _stale_timeout = max(_stale_timeout, _codex_floor)
 
@@ -1524,7 +1635,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
-    if _est_tokens_for_codex_watchdog > 100_000:
+    if _openai_codex_backend:
+        _codex_idle_timeout_default = openai_codex_event_stale_timeout(
+            _est_tokens_for_codex_watchdog,
+            _codex_reasoning_effort,
+        )
+    elif _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
     elif _est_tokens_for_codex_watchdog > 50_000:
         _codex_idle_timeout_default = 120.0
@@ -2280,6 +2396,14 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
 
+    # Lossless Responses history sidecar. Unlike the legacy reasoning/message
+    # projections this also carries provider-hosted calls (web/image/file/code/
+    # MCP) in their original output order, so store:false/manual continuation
+    # can replay every response output item after a process restart.
+    codex_output_items = getattr(assistant_message, "codex_output_items", None)
+    if codex_output_items:
+        msg["codex_output_items"] = codex_output_items
+
     if assistant_tool_calls:
         tool_calls = []
         for tool_call in assistant_tool_calls:
@@ -2943,7 +3067,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
+            for schema_foreign in (
+                "tool_name",
+                "codex_output_items",
+                "codex_reasoning_items",
+                "codex_message_items",
+                "timestamp",
+            ):
                 api_msg.pop(schema_foreign, None)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —

@@ -58,7 +58,7 @@ class TestBuildReplayEntry:
         assert entry == {"role": "assistant", "content": "answer"}
 
 
-    def test_assistant_preserves_all_six_fields_together(self):
+    def test_assistant_preserves_all_seven_fields_together(self):
         details = [{"type": "reasoning.summary", "summary": "s"}]
         codex_items = [{"type": "reasoning", "encrypted_content": "b"}]
         msg_items = [
@@ -69,12 +69,17 @@ class TestBuildReplayEntry:
                 "content": [{"type": "output_text", "text": "x"}],
             }
         ]
+        output_items = [
+            {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+            *msg_items,
+        ]
         msg = {
             "role": "assistant",
             "content": "answer",
             "reasoning": "thinking",
             "reasoning_content": "structured",
             "reasoning_details": details,
+            "codex_output_items": output_items,
             "codex_reasoning_items": codex_items,
             "codex_message_items": msg_items,
             "finish_reason": "stop",
@@ -83,6 +88,7 @@ class TestBuildReplayEntry:
         assert entry["reasoning"] == "thinking"
         assert entry["reasoning_content"] == "structured"
         assert entry["reasoning_details"] == details
+        assert entry["codex_output_items"] == output_items
         assert entry["codex_reasoning_items"] == codex_items
         assert entry["codex_message_items"] == msg_items
         assert entry["finish_reason"] == "stop"
@@ -94,6 +100,7 @@ class TestBuildReplayEntry:
             "reasoning",
             "reasoning_content",
             "reasoning_details",
+            "codex_output_items",
             "codex_reasoning_items",
             "codex_message_items",
             "finish_reason",
@@ -142,4 +149,3 @@ class TestGatewayHistoryBuildForwardsSidecar:
         ]
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
-

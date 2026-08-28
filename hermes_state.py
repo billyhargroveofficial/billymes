@@ -11053,8 +11053,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def _reasoning_json_text(value: Any) -> Optional[str]:
         """Serialize a structured reasoning field for its TEXT column.
 
-        ``reasoning_details`` / ``codex_reasoning_items`` / ``codex_message_items``
-        arrive as list/dict structures from the live runtime, but callers that
+        ``reasoning_details`` / ``codex_reasoning_items`` /
+        ``codex_message_items`` / ``codex_output_items`` arrive as list/dict
+        structures from the live runtime, but callers that
         round-trip stored rows — ``get_messages`` straight into
         ``replace_messages``, e.g. the POST /api/sessions/{id}/fork handler —
         hand back the raw TEXT these columns already hold, because
@@ -11086,6 +11087,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        codex_output_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
@@ -11125,6 +11127,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details_json = self._reasoning_json_text(reasoning_details)
         codex_items_json = self._reasoning_json_text(codex_reasoning_items)
         codex_message_items_json = self._reasoning_json_text(codex_message_items)
+        codex_output_items_json = self._reasoning_json_text(codex_output_items)
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -11165,8 +11168,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_output_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -11183,6 +11186,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_output_items_json,
                     platform_message_id,
                     1 if observed else 0,
                     1 if _compressed_summary else 0,
@@ -11215,6 +11219,96 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # process's FTS optimize) can't destroy a healthy turn (#74478).
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def strip_codex_encrypted_replay(
+        self,
+        session_id: str,
+        *,
+        compression_lock_holder: Optional[str] = None,
+        turn_lease_holder: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> Dict[str, int]:
+        """Durably remove rejected encrypted Responses replay from a session.
+
+        ``invalid_encrypted_content`` recovery also mutates the hydrated
+        message dicts, but resumed rows carry the intrinsic ``_db_persisted``
+        marker and append-only turn flushing intentionally skips them.  Update
+        the source rows in one guarded transaction so a process restart cannot
+        restore the rejected blobs.  Non-encrypted hosted calls and assistant
+        message items in the authoritative output snapshot are preserved.
+        """
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                compression_lock_holder,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            rows = conn.execute(
+                """SELECT id, codex_reasoning_items, codex_output_items
+                   FROM messages
+                   WHERE session_id = ? AND role = 'assistant' AND active = 1
+                     AND (codex_reasoning_items IS NOT NULL
+                          OR codex_output_items IS NOT NULL)""",
+                (session_id,),
+            ).fetchall()
+
+            stripped_messages = 0
+            stripped_items = 0
+            for row in rows:
+                legacy_items = row["codex_reasoning_items"]
+                output_items_raw = row["codex_output_items"]
+                output_items_json = output_items_raw
+                row_changed = legacy_items is not None
+
+                if legacy_items is not None:
+                    try:
+                        parsed_legacy = json.loads(legacy_items)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_legacy = None
+                    if isinstance(parsed_legacy, list):
+                        stripped_items += len(parsed_legacy)
+
+                if output_items_raw is not None:
+                    try:
+                        parsed_output = json.loads(output_items_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_output = None
+                    if isinstance(parsed_output, list):
+                        kept_output = [
+                            item
+                            for item in parsed_output
+                            if not (
+                                isinstance(item, dict)
+                                and item.get("type") in {"reasoning", "compaction"}
+                            )
+                        ]
+                        removed_count = len(parsed_output) - len(kept_output)
+                        if removed_count:
+                            stripped_items += removed_count
+                            row_changed = True
+                            output_items_json = (
+                                json.dumps(kept_output) if kept_output else None
+                            )
+
+                if not row_changed:
+                    continue
+                conn.execute(
+                    """UPDATE messages
+                       SET codex_reasoning_items = NULL, codex_output_items = ?
+                       WHERE id = ?""",
+                    (output_items_json, row["id"]),
+                )
+                stripped_messages += 1
+
+            return {"messages": stripped_messages, "items": stripped_items}
+
+        return self._execute_write(
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
         )
 
     def append_messages_batch(
@@ -11572,9 +11666,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
+            codex_output_items = (
+                msg.get("codex_output_items") if role == "assistant" else None
+            )
             reasoning_details_json = self._reasoning_json_text(reasoning_details)
             codex_items_json = self._reasoning_json_text(codex_reasoning_items)
             codex_message_items_json = self._reasoning_json_text(codex_message_items)
+            codex_output_items_json = self._reasoning_json_text(codex_output_items)
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -11597,8 +11695,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_output_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -11615,6 +11713,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_output_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1 if msg.get("_compressed_summary") else 0,
@@ -12471,7 +12570,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+        "codex_reasoning_items, codex_message_items, codex_output_items, "
+        "platform_message_id, observed, "
         "_compressed_summary, timestamp, "
         "api_content, display_kind, display_metadata"
     )
@@ -12591,6 +12691,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+                if row["codex_output_items"]:
+                    try:
+                        msg["codex_output_items"] = json.loads(row["codex_output_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize codex_output_items, falling back to None")
+                        msg["codex_output_items"] = None
             if include_ancestors:
                 canonical_content, _is_composite = (
                     self._canonical_replayed_user_content(msg)

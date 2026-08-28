@@ -1338,6 +1338,9 @@ class TestRewriteTranscriptPreservesReasoning:
             reasoning="I need to think step by step.",
             reasoning_content="provider scratchpad",
             reasoning_details=[{"type": "summary", "text": "step by step"}],
+            codex_output_items=[
+                {"id": "ws1", "type": "web_search_call", "status": "completed"}
+            ],
             codex_reasoning_items=[{"id": "r1", "type": "reasoning"}],
         )
 
@@ -1346,6 +1349,9 @@ class TestRewriteTranscriptPreservesReasoning:
         assert before[0].get("reasoning") == "I need to think step by step."
         assert before[0].get("reasoning_content") == "provider scratchpad"
         assert before[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
+        assert before[0].get("codex_output_items") == [
+            {"id": "ws1", "type": "web_search_call", "status": "completed"}
+        ]
         assert before[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
 
         # Now simulate /retry: build the SessionStore and call rewrite_transcript
@@ -1363,7 +1369,41 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning") == "I need to think step by step."
         assert after[0].get("reasoning_content") == "provider scratchpad"
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
+        assert after[0].get("codex_output_items") == [
+            {"id": "ws1", "type": "web_search_call", "status": "completed"}
+        ]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+
+    def test_live_transcript_append_persists_full_codex_output(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "append.db")
+        session_id = "hosted-output"
+        db.create_session(session_id=session_id, source="gateway")
+        store = object.__new__(SessionStore)
+        store._db = db
+        output_items = [
+            {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"query": "oauth"},
+            }
+        ]
+
+        store._append_transcript_message(
+            session_id,
+            {
+                "role": "assistant",
+                "content": "done",
+                "codex_output_items": output_items,
+            },
+        )
+
+        assert db.get_messages_as_conversation(session_id)[0][
+            "codex_output_items"
+        ] == output_items
+        db.close()
 
 
 class TestGatewaySessionDbRecovery:
@@ -1642,5 +1682,3 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
-

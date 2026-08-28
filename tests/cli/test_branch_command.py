@@ -198,6 +198,10 @@ CODEX_MESSAGE_ITEMS = [
         "content": [{"type": "output_text", "text": "done"}],
     }
 ]
+CODEX_OUTPUT_ITEMS = [
+    {"id": "ws_1", "type": "web_search_call", "status": "completed"},
+    *CODEX_MESSAGE_ITEMS,
+]
 
 
 class TestBranchPreservesReasoningFields:
@@ -220,6 +224,7 @@ class TestBranchPreservesReasoningFields:
                 "content": "def sort_list(lst): return sorted(lst)",
                 "reasoning": "picked sorted()",
                 "reasoning_details": REASONING_DETAILS,
+                "codex_output_items": CODEX_OUTPUT_ITEMS,
                 "codex_reasoning_items": CODEX_REASONING_ITEMS,
                 "codex_message_items": CODEX_MESSAGE_ITEMS,
             },
@@ -230,5 +235,6 @@ class TestBranchPreservesReasoningFields:
         messages = session_db.get_messages_as_conversation(cli_instance.session_id)
         assistant = next(m for m in messages if m["role"] == "assistant")
         assert assistant["reasoning_details"] == REASONING_DETAILS
+        assert assistant["codex_output_items"] == CODEX_OUTPUT_ITEMS
         assert assistant["codex_reasoning_items"] == CODEX_REASONING_ITEMS
         assert assistant["codex_message_items"] == CODEX_MESSAGE_ITEMS

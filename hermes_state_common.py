@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -444,6 +444,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
+    codex_output_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     _compressed_summary INTEGER NOT NULL DEFAULT 0,

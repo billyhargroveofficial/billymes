@@ -1884,6 +1884,22 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
             (i.get("id") if isinstance(i, dict) else getattr(i, "id", None)) == "rs_2"
             for i in items
         )
+    # The complete output snapshots are concatenated when the transcript rows
+    # are visually deduplicated: store=false requires every item from both
+    # provider responses on the next manual replay.
+    output_items = incompletes[0].get("codex_output_items")
+    assert isinstance(output_items, list)
+    assert [item.get("type") for item in output_items] == [
+        "reasoning",
+        "message",
+        "reasoning",
+        "message",
+    ]
+    assert [
+        item.get("id")
+        for item in output_items
+        if item.get("type") == "reasoning"
+    ] == ["rs_1", "rs_2"]
 
 
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):

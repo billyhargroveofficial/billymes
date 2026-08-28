@@ -5,6 +5,7 @@ and run_agent.py for pre-flight context checks.
 """
 
 import base64
+import copy
 import hashlib
 import ipaddress
 import json
@@ -2661,13 +2662,82 @@ def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
     return None
 
 
-_codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
+# Full, account-scoped Codex ``/models`` snapshots.  The historical name is
+# retained because a few tests and downstream integrations clear this private
+# cache between credential changes.  Values used to contain only
+# ``{slug: context_window}``; retaining the complete model descriptor here
+# keeps those consumers working while making catalog-only capabilities such as
+# ``use_responses_lite`` available to the direct OAuth runtime.
+_codex_oauth_context_cache: Dict[
+    str, Tuple[Dict[str, Dict[str, Any]], float]
+] = {}
 _CODEX_OAUTH_CONTEXT_CACHE_TTL = 3600  # 1 hour
 
 
 def _codex_oauth_token_fingerprint(access_token: str) -> str:
     """Return a non-secret cache key for a Codex OAuth access token."""
     return hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:16]
+
+
+def _codex_oauth_catalog_from_entries(entries: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize a Codex model list into a case-insensitive metadata lookup.
+
+    The backend payload is JSON, but callers may also provide an already
+    indexed mapping in tests or integrations.  Every descriptor is deep-copied
+    before entering the cache so request/transport code cannot accidentally
+    mutate a shared catalog snapshot.
+    """
+    if isinstance(entries, dict):
+        if isinstance(entries.get("models"), list):
+            entries = entries["models"]
+        elif isinstance(entries.get("slug"), str):
+            entries = [entries]
+        else:
+            indexed_entries: List[Dict[str, Any]] = []
+            for key, value in entries.items():
+                if not isinstance(value, dict):
+                    continue
+                item = copy.deepcopy(value)
+                if not isinstance(item.get("slug"), str) or not item["slug"].strip():
+                    item["slug"] = str(key)
+                indexed_entries.append(item)
+            entries = indexed_entries
+
+    if not isinstance(entries, (list, tuple)):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for raw_item in entries:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_slug = raw_item.get("slug")
+        if not isinstance(raw_slug, str) or not raw_slug.strip():
+            continue
+        slug = raw_slug.strip()
+        item = copy.deepcopy(raw_item)
+        item["slug"] = slug
+        # First occurrence wins, matching Codex's ordered model catalog and
+        # avoiding a malformed duplicate silently overriding the primary row.
+        result.setdefault(slug.lower(), item)
+    return result
+
+
+def _remember_codex_oauth_model_catalog(
+    access_token: str,
+    entries: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """Store a full Codex catalog snapshot under a non-secret token key.
+
+    ``hermes_cli.codex_models`` calls this after its picker fetch, allowing the
+    direct Responses transport to reuse the same response instead of issuing a
+    second ``/models`` request.  Empty or malformed payloads never evict a
+    healthy snapshot.
+    """
+    catalog = _codex_oauth_catalog_from_entries(entries)
+    if access_token and catalog:
+        cache_key = _codex_oauth_token_fingerprint(access_token)
+        _codex_oauth_context_cache[cache_key] = (catalog, time.time())
+    return catalog
 
 
 def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
@@ -2698,13 +2768,13 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-def _fetch_codex_oauth_context_lengths_with_source(
+def _fetch_codex_oauth_model_catalog_with_source(
     access_token: str,
-) -> Tuple[Dict[str, int], bool]:
-    """Fetch Codex catalogue data and report whether it came from HTTP.
+) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    """Fetch the full Codex model catalog and report whether it came from HTTP.
 
     The in-process cache is scoped by token fingerprint because Codex model
-    availability and context windows can vary by account entitlement. The raw
+    availability and capabilities can vary by account entitlement. The raw
     token is never retained in the cache key. The boolean is false for a
     same-token in-process hit, which must not be treated as a fresh provider
     confirmation when deciding whether to update persistent state.
@@ -2743,18 +2813,29 @@ def _fetch_codex_oauth_context_lengths_with_source(
         return {}, False
 
     entries = data.get("models", []) if isinstance(data, dict) else []
-    result: Dict[str, int] = {}
-    for item in entries:
-        if not isinstance(item, dict):
-            continue
-        slug = item.get("slug")
-        ctx = item.get("context_window")
-        if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
-            result[slug.strip()] = ctx
-
+    result = _codex_oauth_catalog_from_entries(entries)
     if result:
         _codex_oauth_context_cache[cache_key] = (result, now)
     return result, True
+
+
+def _fetch_codex_oauth_context_lengths_with_source(
+    access_token: str,
+) -> Tuple[Dict[str, int], bool]:
+    """Compatibility view of the full catalog as ``{slug: context_window}``."""
+    catalog, fresh = _fetch_codex_oauth_model_catalog_with_source(access_token)
+    result: Dict[str, int] = {}
+    for item in catalog.values():
+        slug = item.get("slug")
+        ctx = item.get("context_window")
+        if (
+            isinstance(slug, str)
+            and isinstance(ctx, int)
+            and not isinstance(ctx, bool)
+            and ctx > 0
+        ):
+            result[slug] = ctx
+    return result, fresh
 
 
 def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
@@ -2768,6 +2849,77 @@ def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
     """
     result, _fresh = _fetch_codex_oauth_context_lengths_with_source(access_token)
     return result
+
+
+def get_codex_oauth_model_metadata(
+    model: str,
+    access_token: str = "",
+    *,
+    catalog: Any = None,
+    allow_fetch: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Return a detached descriptor for a direct Codex OAuth model.
+
+    ``catalog`` accepts either the backend shape (``{"models": [...]}``), a
+    model list, or a mapping keyed by slug.  Supplying it makes the function
+    pure/no-I/O, which is useful when the caller already owns a catalog.
+    Otherwise an authenticated, token-scoped snapshot is fetched/reused.
+
+    Hermes ``-900k`` picker aliases and optional ``vendor/`` namespaces are
+    resolved to their actual wire slug before lookup.  Unknown metadata
+    returns ``None`` rather than guessing a backend capability.
+    """
+    if catalog is None:
+        if not access_token:
+            return None
+        if allow_fetch:
+            normalized, _fresh = _fetch_codex_oauth_model_catalog_with_source(
+                access_token
+            )
+        else:
+            cache_key = _codex_oauth_token_fingerprint(access_token)
+            cached = _codex_oauth_context_cache.get(cache_key)
+            if cached is None or time.time() - cached[1] >= _CODEX_OAUTH_CONTEXT_CACHE_TTL:
+                return None
+            normalized = cached[0]
+    else:
+        normalized = _codex_oauth_catalog_from_entries(catalog)
+
+    normalized_model = _strip_provider_prefix((model or "").strip())
+    lookup = _bare_codex_slug(strip_codex_context_variant_suffix(normalized_model))
+    if not lookup:
+        return None
+    item = normalized.get(lookup.lower())
+    return copy.deepcopy(item) if item is not None else None
+
+
+def should_use_codex_responses_lite(
+    model: str,
+    access_token: str = "",
+    *,
+    catalog: Any = None,
+    force_classic: bool = False,
+    has_hosted_tools: bool = False,
+    allow_fetch: bool = True,
+) -> bool:
+    """Return whether this direct OAuth request may use Responses Lite.
+
+    Eligibility is catalog-driven and fail-closed: only the literal boolean
+    ``use_responses_lite: true`` enables Lite.  ``force_classic`` is the
+    transport-level escape hatch for request features that Lite cannot encode;
+    ``has_hosted_tools`` is provided explicitly for the common hosted
+    web/image-search case.  Either override wins without performing network
+    I/O.
+    """
+    if force_classic or has_hosted_tools:
+        return False
+    metadata = get_codex_oauth_model_metadata(
+        model,
+        access_token=access_token,
+        catalog=catalog,
+        allow_fetch=allow_fetch,
+    )
+    return metadata is not None and metadata.get("use_responses_lite") is True
 
 
 def _resolve_codex_oauth_context_length_with_source(
@@ -3680,6 +3832,9 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     * Base64 image payloads are replaced with a placeholder; they are charged
       separately at a flat rate by ``_count_image_tokens``, and counting their
       raw chars here would massively overestimate usage.
+    * A complete ``codex_output_items`` snapshot supersedes the legacy split
+      Codex sidecars for accounting, avoiding duplicate replay charges during
+      migration while older rows without the snapshot keep their old estimate.
     """
     sidecar = msg.get("api_content")
     sidecar_wins = (
@@ -3687,9 +3842,20 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
         and bool(sidecar)
         and msg.get("role") in ("user", "assistant")
     )
+    has_full_codex_output = bool(msg.get("codex_output_items"))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+            continue
+        # New Codex rows retain the legacy split sidecars for compatibility,
+        # but the complete output snapshot is authoritative and already
+        # contains the same reasoning/message items.  Counting all three here
+        # makes generic preflight see roughly triple the replay payload while
+        # the tail-budget estimator correctly charges it once.
+        if has_full_codex_output and k in {
+            "codex_reasoning_items",
+            "codex_message_items",
+        }:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it

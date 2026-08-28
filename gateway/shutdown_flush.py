@@ -351,6 +351,16 @@ def recover_pending_to_db(
                     session_id=spooled_sid,
                     role=message.get("role", "unknown"),
                     content=message.get("content") or "",
+                    tool_name=message.get("tool_name"),
+                    tool_calls=message.get("tool_calls"),
+                    tool_call_id=message.get("tool_call_id"),
+                    finish_reason=message.get("finish_reason"),
+                    reasoning=message.get("reasoning"),
+                    reasoning_content=message.get("reasoning_content"),
+                    reasoning_details=message.get("reasoning_details"),
+                    codex_output_items=message.get("codex_output_items"),
+                    codex_reasoning_items=message.get("codex_reasoning_items"),
+                    codex_message_items=message.get("codex_message_items"),
                     timestamp=message.get("timestamp") or payload.get("ts"),
                 )
                 recovered += 1

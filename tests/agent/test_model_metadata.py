@@ -392,6 +392,100 @@ class TestCodexOAuthContextLength:
         mm._codex_oauth_context_cache = {}
 
 
+    def test_full_model_metadata_is_retained_and_reused(self):
+        """The compatibility context view must not discard transport flags."""
+        from agent import model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-luna",
+                    "context_window": 272_000,
+                    "use_responses_lite": True,
+                    "prefer_websockets": True,
+                    "model_messages": {
+                        "instructions_template": "catalog instructions",
+                    },
+                }
+            ]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=response) as mock_get:
+            contexts = mm._fetch_codex_oauth_context_lengths("account-token")
+            metadata = mm.get_codex_oauth_model_metadata(
+                "openai/gpt-5.6-luna-900k",
+                access_token="account-token",
+            )
+            use_lite = mm.should_use_codex_responses_lite(
+                "gpt-5.6-luna",
+                access_token="account-token",
+            )
+
+        assert contexts == {"gpt-5.6-luna": 272_000}
+        assert metadata == response.json.return_value["models"][0]
+        assert metadata["prefer_websockets"] is True
+        assert use_lite is True
+        mock_get.assert_called_once()
+
+        # The lookup returns a detached copy; callers cannot poison the cached
+        # catalog for later turns.
+        metadata["model_messages"]["instructions_template"] = "mutated"
+        again = mm.get_codex_oauth_model_metadata(
+            "gpt-5.6-luna",
+            access_token="account-token",
+        )
+        assert again["model_messages"]["instructions_template"] == "catalog instructions"
+
+    def test_responses_lite_helper_is_pure_and_fail_closed_with_catalog(self):
+        from agent import model_metadata as mm
+
+        catalog = {
+            "models": [
+                {"slug": "gpt-5.6-sol", "use_responses_lite": True},
+                {"slug": "gpt-5.5", "use_responses_lite": False},
+                # A string is not accepted as an accidental truthy flag.
+                {"slug": "gpt-malformed", "use_responses_lite": "true"},
+            ]
+        }
+
+        with patch(
+            "agent.model_metadata.requests.get",
+            side_effect=AssertionError("explicit catalog must not perform I/O"),
+        ):
+            assert mm.should_use_codex_responses_lite(
+                "gpt-5.6-sol-900k", catalog=catalog
+            ) is True
+            assert mm.should_use_codex_responses_lite(
+                "gpt-5.5", catalog=catalog
+            ) is False
+            assert mm.should_use_codex_responses_lite(
+                "gpt-malformed", catalog=catalog
+            ) is False
+            assert mm.should_use_codex_responses_lite(
+                "gpt-unknown", catalog=catalog
+            ) is False
+
+    def test_classic_overrides_short_circuit_before_catalog_lookup(self):
+        from agent import model_metadata as mm
+
+        with patch(
+            "agent.model_metadata.requests.get",
+            side_effect=AssertionError("classic override must not fetch catalog"),
+        ):
+            assert mm.should_use_codex_responses_lite(
+                "gpt-5.6-sol",
+                access_token="account-token",
+                force_classic=True,
+            ) is False
+            assert mm.should_use_codex_responses_lite(
+                "gpt-5.6-sol",
+                access_token="account-token",
+                has_hosted_tools=True,
+            ) is False
+
+
 
     def test_live_catalogue_cache_is_scoped_to_access_token(self):
         """Different OAuth tokens must not share entitlement-specific metadata."""

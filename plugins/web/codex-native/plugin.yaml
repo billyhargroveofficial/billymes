@@ -1,0 +1,7 @@
+name: codex-native
+version: 1.0.0
+description: "Native hosted web search through the active Hermes profile's ChatGPT/Codex OAuth subscription."
+author: billyhargroveofficial
+kind: backend
+provides_web_providers:
+  - codex-native

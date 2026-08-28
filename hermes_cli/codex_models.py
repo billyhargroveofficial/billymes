@@ -168,6 +168,15 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
             return []
         data = resp.json()
         entries = data.get("models", []) if isinstance(data, dict) else []
+        # Preserve the complete per-model descriptors for the direct OAuth
+        # runtime.  Historically this picker path immediately reduced the
+        # response to slugs, discarding transport capabilities such as
+        # ``use_responses_lite`` and ``prefer_websockets``.  The helper keeps
+        # the snapshot account-scoped via a token fingerprint and never stores
+        # the raw credential.
+        from agent.model_metadata import _remember_codex_oauth_model_catalog
+
+        _remember_codex_oauth_model_catalog(access_token, entries)
     except Exception as exc:
         logger.debug("Failed to fetch Codex models from API: %s", exc)
         return []

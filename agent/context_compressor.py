@@ -380,7 +380,7 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
 
 
 def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
-    """Strip stale per-turn replay items (``codex_reasoning_items``) from
+    """Strip stale per-turn reasoning from Codex replay sidecars on
     assistant messages that belong to turns older than the active one.
 
     During Codex/Responses sessions, every retained assistant message carries
@@ -430,6 +430,26 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
         msg = messages[i]
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
+        message_pruned = False
+
+        # ``codex_output_items`` is the authoritative, ordered snapshot of
+        # the whole Responses output.  Only reasoning items are stale here;
+        # hosted calls and assistant message items remain required manual
+        # history and must not be discarded with the reasoning envelope.
+        output_items = msg.get("codex_output_items")
+        if isinstance(output_items, list) and output_items:
+            kept_output = [
+                item
+                for item in output_items
+                if not (isinstance(item, dict) and item.get("type") == "reasoning")
+            ]
+            if len(kept_output) != len(output_items):
+                if kept_output:
+                    msg["codex_output_items"] = kept_output
+                else:
+                    msg.pop("codex_output_items", None)
+                message_pruned = True
+
         for key in _STALE_REPLAY_PRUNE_KEYS:
             items = msg.get(key)
             if not isinstance(items, list) or not items:
@@ -445,6 +465,8 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
                 msg[key] = kept
             else:
                 msg.pop(key, None)
+            message_pruned = True
+        if message_pruned:
             pruned += 1
     return pruned
 
@@ -1476,6 +1498,7 @@ def _serialized_length_for_budget(value: Any) -> int:
 _REPLAY_BUDGET_KEYS = (
     "reasoning",
     "reasoning_content",
+    "codex_output_items",
     "codex_reasoning_items",
     "codex_message_items",
 )
@@ -1492,6 +1515,7 @@ _REPLAY_BUDGET_KEYS = (
 # never reach the wire, so the tail cut landed early and each compaction
 # discarded more real transcript than configured.
 _ALWAYS_REPLAYED_BUDGET_KEYS = (
+    "codex_output_items",
     "codex_reasoning_items",
     "codex_message_items",
 )
@@ -1586,8 +1610,16 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             tokens += estimate_tokens_rough(str(tc))
-    for key in _ALWAYS_REPLAYED_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    # New sessions persist the complete output snapshot.  It contains the
+    # same reasoning/message entries as the legacy split sidecars, which are
+    # retained during migration for older consumers.  Charge the authoritative
+    # snapshot once; fall back to the split fields for pre-migration rows.
+    output_items = msg.get("codex_output_items")
+    if output_items:
+        tokens += _serialized_length_for_budget(output_items) // _CHARS_PER_TOKEN
+    else:
+        for key in ("codex_reasoning_items", "codex_message_items"):
+            tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     if not charge_stale_thinking:
         return tokens
     for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
@@ -1660,6 +1692,132 @@ def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -
     return text + rendered if prepend else rendered + text
 
 
+def _rewritten_assistant_output_parts(content: Any) -> List[Dict[str, str]]:
+    """Project rewritten chat content into synthetic Responses output parts."""
+    if isinstance(content, str):
+        return [{"type": "output_text", "text": content}] if content else []
+    if not isinstance(content, list):
+        return []
+    parts: List[Dict[str, str]] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                parts.append({"type": "output_text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        text = item.get("text")
+        if item_type in {"text", "input_text", "output_text"} and isinstance(text, str):
+            if text:
+                parts.append({"type": "output_text", "text": text})
+    return parts
+
+
+def _refresh_codex_replay_after_content_rewrite(msg: Dict[str, Any]) -> None:
+    """Keep Responses replay sidecars aligned with rewritten assistant content.
+
+    ``codex_output_items`` is authoritative in the Responses adapter. A local
+    compaction rewrite that changes only ``msg["content"]`` is therefore
+    invisible on the wire unless the exact-output snapshot is updated too.
+    Replace its assistant message item in place (preserving hosted calls,
+    reasoning, and function-call ordering), and keep the legacy message sidecar
+    in sync for rows whose full snapshot is later filtered by issuer/gating.
+    """
+    drop_stale_api_content(msg)
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return
+
+    output_items = msg.get("codex_output_items")
+    message_items = msg.get("codex_message_items")
+    if not isinstance(output_items, list) and not isinstance(message_items, list):
+        return
+
+    parts = _rewritten_assistant_output_parts(msg.get("content"))
+    synthetic = (
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": parts,
+        }
+        if parts
+        else None
+    )
+
+    if isinstance(output_items, list):
+        rewritten: List[Any] = []
+        replaced_message = False
+        for item in output_items:
+            is_assistant_message = (
+                isinstance(item, dict)
+                and item.get("type") == "message"
+                and item.get("role") == "assistant"
+            )
+            if not is_assistant_message:
+                rewritten.append(item)
+                continue
+            if synthetic is not None and not replaced_message:
+                rewritten.append(synthetic)
+                replaced_message = True
+
+        if synthetic is not None and not replaced_message:
+            # Chat-style reconstruction emits assistant content after leading
+            # reasoning/checkpoints and before calls. Match that ordering when
+            # a tool-call-only provider snapshot gains a synthetic summary.
+            insert_at = 0
+            while (
+                insert_at < len(rewritten)
+                and isinstance(rewritten[insert_at], dict)
+                and rewritten[insert_at].get("type") in {"reasoning", "compaction"}
+            ):
+                insert_at += 1
+            rewritten.insert(insert_at, synthetic)
+        if rewritten:
+            msg["codex_output_items"] = rewritten
+        else:
+            msg.pop("codex_output_items", None)
+
+    if isinstance(message_items, list):
+        if synthetic is not None:
+            msg["codex_message_items"] = [synthetic]
+        else:
+            msg.pop("codex_message_items", None)
+
+
+def _remove_codex_replay_tool_calls(
+    msg: Dict[str, Any],
+    removed_calls: List[Any],
+) -> None:
+    """Remove locally-pruned function calls from the authoritative snapshot."""
+    output_items = msg.get("codex_output_items")
+    if not isinstance(output_items, list) or not removed_calls:
+        return
+    removed_ids: set[str] = set()
+    for call in removed_calls:
+        removed_ids |= set(ContextCompressor._tool_call_id_variants(call))
+    if not removed_ids:
+        return
+
+    kept: List[Any] = []
+    changed = False
+    for item in output_items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") in {"function_call", "custom_tool_call"}
+            and (ContextCompressor._tool_call_id_variants(item) & removed_ids)
+        ):
+            changed = True
+            continue
+        kept.append(item)
+    if not changed:
+        return
+    if kept:
+        msg["codex_output_items"] = kept
+    else:
+        msg.pop("codex_output_items", None)
+
+
 def _strip_image_parts_from_parts(parts: Any) -> Any:
     """Strip image parts from an OpenAI-style content-parts list.
 
@@ -1715,13 +1873,13 @@ def _strip_images_from_tool_msg(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if isinstance(content, dict) and content.get("_multimodal"):
         summary = content.get("text_summary") or "[screenshot removed to save context]"
         new_msg = {**msg, "content": f"[screenshot removed] {str(summary)[:200]}"}
-        drop_stale_api_content(new_msg)
+        _refresh_codex_replay_after_content_rewrite(new_msg)
         return new_msg
     stripped = _strip_image_parts_from_parts(content)
     if stripped is None:
         return None
     new_msg = {**msg, "content": stripped}
-    drop_stale_api_content(new_msg)
+    _refresh_codex_replay_after_content_rewrite(new_msg)
     return new_msg
 
 
@@ -1992,7 +2150,7 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         new_msg["content"] = _strip_images_from_content(content)
         # Content rewritten → the api_content sidecar (exact bytes previously
         # sent) is stale; drop it so replay can't resend the pre-rewrite bytes.
-        drop_stale_api_content(new_msg)
+        _refresh_codex_replay_after_content_rewrite(new_msg)
         result.append(new_msg)
         changed = True
 
@@ -5942,6 +6100,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     unwrapped = message.copy()
                     unwrapped["content"] = prior
                     unwrapped.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    _refresh_codex_replay_after_content_rewrite(unwrapped)
                     return unwrapped
             else:
                 marker_idx = content.find(_SUMMARY_END_MARKER)
@@ -5951,6 +6110,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                         unwrapped = message.copy()
                         unwrapped["content"] = remainder
                         unwrapped.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                        _refresh_codex_replay_after_content_rewrite(unwrapped)
                         return unwrapped
 
         if isinstance(content, list):
@@ -6003,6 +6163,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     unwrapped = message.copy()
                     unwrapped["content"] = legacy_blocks
                     unwrapped.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    _refresh_codex_replay_after_content_rewrite(unwrapped)
                     return unwrapped
 
             if found_delimiter:
@@ -6031,6 +6192,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     unwrapped = message.copy()
                     unwrapped["content"] = prior_blocks
                     unwrapped.pop(COMPRESSED_SUMMARY_METADATA_KEY, None)
+                    _refresh_codex_replay_after_content_rewrite(unwrapped)
                     return unwrapped
 
         return None
@@ -6154,6 +6316,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     continue
                 kept = [tc for tc in tcs if self._tool_call_id_variants(tc) & result_call_ids]
                 if len(kept) != len(tcs):
+                    removed = [tc for tc in tcs if tc not in kept]
+                    _remove_codex_replay_tool_calls(msg, removed)
                     stripped_count += len(tcs) - len(kept)
                     if kept:
                         msg["tool_calls"] = kept
@@ -6164,6 +6328,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                         content = msg.get("content")
                         if not content or (isinstance(content, str) and not content.strip()):
                             msg["content"] = "(tool call removed)"
+                            _refresh_codex_replay_after_content_rewrite(msg)
             if stripped_count and not self.quiet_mode:
                 logger.info(
                     "Compression sanitizer: stripped %d orphaned tool_call(s) from assistant messages",
@@ -8251,7 +8416,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Content rewritten → the api_content sidecar (exact bytes
                 # previously sent) is stale; drop it so replay can't resend
                 # the pre-merge bytes without the summary.
-                drop_stale_api_content(msg)
+                _refresh_codex_replay_after_content_rewrite(msg)
                 _merge_summary_into_tail = False
             compressed.append(msg)
 

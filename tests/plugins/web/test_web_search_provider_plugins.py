@@ -2,8 +2,8 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai) instantiate and self-report the expected
+- All bundled plugins (brave-free, codex-native, ddgs, searxng, exa,
+  parallel, tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -77,6 +77,7 @@ class TestBundledPluginsRegister:
         names = sorted(p.name for p in list_providers())
         assert names == [
             "brave-free",
+            "codex-native",
             "ddgs",
             "exa",
             "firecrawl",
@@ -91,6 +92,7 @@ class TestBundledPluginsRegister:
         "plugin_name,expected_search,expected_extract",
         [
             ("brave-free", True, False),
+            ("codex-native", True, False),
             ("ddgs", True, False),
             ("searxng", True, False),
             ("exa", True, True),
@@ -117,7 +119,17 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        [
+            "brave-free",
+            "codex-native",
+            "ddgs",
+            "searxng",
+            "exa",
+            "parallel",
+            "tavily",
+            "firecrawl",
+            "xai",
+        ],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -329,5 +341,4 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
-
 

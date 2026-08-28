@@ -13,9 +13,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import unicodedata
 import uuid
+from base64 import b64encode
+from datetime import date, datetime
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -468,6 +472,325 @@ _RESPONSE_MESSAGE_STATUSES = {"completed", "incomplete", "in_progress"}
 _MAX_RESPONSES_ITEM_ID_LENGTH = 64
 
 
+# Provider-produced ``response.output`` items that can be replayed as manual
+# history when ``store=false``.  The Responses contract is deliberately wider
+# than the subset Hermes executes client-side: hosted calls (web/file search,
+# code interpreter, image generation, shell/computer, MCP, and Codex tool
+# search) are model context and MUST be sent back even though Hermes never
+# dispatches them locally.  Keeping this allow-list explicit prevents an
+# arbitrary object persisted in a session from bypassing input preflight.
+_RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = {
+    "additional_tools",
+    "agent_message",
+    "apply_patch_call",
+    "apply_patch_call_output",
+    "code_interpreter_call",
+    "computer_call",
+    "computer_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "file_search_call",
+    "function_call_output",
+    "image_generation_call",
+    "local_shell_call",
+    "local_shell_call_output",
+    "mcp_approval_response",
+    "mcp_approval_request",
+    "mcp_call",
+    "mcp_call_output",
+    "mcp_list_tools",
+    "shell_call",
+    "shell_call_output",
+    "tool_search_call",
+    "tool_search_output",
+    "web_search_call",
+}
+
+
+def _responses_json_compatible(value: Any, *, _seen: Optional[set[int]] = None) -> Any:
+    """Return a deterministic JSON-compatible clone of an SDK/raw value.
+
+    ``response.output_item.done`` can arrive as a raw ``dict``, an OpenAI
+    Pydantic model, or a ``SimpleNamespace`` assembled by the streaming
+    runtime.  Persisting ``__dict__`` directly is unsafe for Pydantic models
+    and nested enums/bytes, while ``str(model)`` loses the wire fields needed
+    for the next turn.  This converter keeps every public field and guarantees
+    that ``json.dumps(result)`` succeeds.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        # JSON NaN/Infinity are not valid request JSON even though Python's
+        # encoder permits them by default.
+        return value if math.isfinite(value) else None
+    if isinstance(value, Enum):
+        return _responses_json_compatible(value.value, _seen=_seen)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return b64encode(bytes(value)).decode("ascii")
+
+    if _seen is None:
+        _seen = set()
+    marker = id(value)
+    if marker in _seen:
+        # Cycles cannot exist in a Responses JSON frame.  Dropping the cyclic
+        # reference is safer than making the entire assistant turn unpersistable.
+        return None
+
+    if isinstance(value, dict):
+        _seen.add(marker)
+        try:
+            return {
+                str(key): _responses_json_compatible(item, _seen=_seen)
+                for key, item in value.items()
+            }
+        finally:
+            _seen.discard(marker)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        _seen.add(marker)
+        try:
+            converted = [
+                _responses_json_compatible(item, _seen=_seen) for item in value
+            ]
+            if isinstance(value, (set, frozenset)):
+                converted.sort(
+                    key=lambda item: json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            return converted
+        finally:
+            _seen.discard(marker)
+
+    # OpenAI SDK response objects are Pydantic models.  Prefer their public
+    # wire dump over __dict__ (which can contain private serializer state).
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        _seen.add(marker)
+        try:
+            for kwargs in (
+                {"mode": "json", "exclude_none": False, "warnings": False},
+                {"mode": "json", "exclude_none": False},
+                {},
+            ):
+                try:
+                    dumped = model_dump(**kwargs)
+                    return _responses_json_compatible(dumped, _seen=_seen)
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+        finally:
+            _seen.discard(marker)
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        _seen.add(marker)
+        try:
+            return _responses_json_compatible(to_dict(), _seen=_seen)
+        except Exception:
+            pass
+        finally:
+            _seen.discard(marker)
+
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        public_attrs = {
+            key: item for key, item in attrs.items()
+            if isinstance(key, str) and not key.startswith("_")
+        }
+        _seen.add(marker)
+        try:
+            return _responses_json_compatible(public_attrs, _seen=_seen)
+        finally:
+            _seen.discard(marker)
+
+    # Unknown scalar-like extension types are diagnostic metadata at most.
+    # A string fallback preserves information while keeping the sidecar JSON.
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _clamp_responses_item_id(item_id: str) -> str:
+    """Deterministically fit a replay-required output item id into 64 chars."""
+    if len(item_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
+        return item_id
+    prefix_match = re.match(r"^([A-Za-z][A-Za-z0-9]*)_", item_id)
+    prefix = prefix_match.group(1) if prefix_match else "item"
+    digest = hashlib.sha256(item_id.encode("utf-8", errors="replace")).hexdigest()[:32]
+    return f"{prefix}_{digest}"
+
+
+def _capture_responses_output_items(
+    output: List[Any],
+    *,
+    issuer_kind: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Capture the complete ordered ``response.output`` snapshot.
+
+    Output-only ids/status and hosted-tool details are kept verbatim here for
+    diagnostics and future transport strategies.  Replay sanitization happens
+    separately, immediately before request construction.
+    """
+    captured: List[Dict[str, Any]] = []
+    for item in output:
+        raw = _responses_json_compatible(item)
+        if not isinstance(raw, dict):
+            continue
+        item_type = raw.get("type")
+        if not isinstance(item_type, str) or not item_type:
+            continue
+        # Same provenance convention as codex_reasoning_items.  This is local
+        # metadata (stripped before replay), not a provider wire field.
+        if (
+            issuer_kind
+            and item_type in {"reasoning", "compaction"}
+            and raw.get("encrypted_content")
+        ):
+            raw["_issuer_kind"] = issuer_kind
+        captured.append(raw)
+    return captured
+
+
+def _sanitize_responses_output_items_for_replay(
+    raw_items: Any,
+    *,
+    is_github_responses: bool = False,
+    replay_encrypted_reasoning: bool = True,
+    current_issuer_kind: Optional[str] = None,
+    native_compaction_eligible: bool = False,
+) -> List[Dict[str, Any]]:
+    """Make a full output snapshot legal as Responses manual-history input.
+
+    The snapshot remains lossless in provider data.  On the wire we follow the
+    native Codex replay contract: retain hosted/message ids and nested payload,
+    remove output-only lifecycle/id fields from client-side calls, normalize
+    paired ``call_id`` values, and preserve item order exactly.
+    """
+    if not isinstance(raw_items, list):
+        return []
+
+    replay: List[Dict[str, Any]] = []
+    for value in raw_items:
+        item = _responses_json_compatible(value)
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
+
+        item_issuer = item.pop("_issuer_kind", None)
+        if item_type in {"reasoning", "compaction"}:
+            if not replay_encrypted_reasoning:
+                continue
+            if (
+                current_issuer_kind is not None
+                and item_issuer is not None
+                and item_issuer != current_issuer_kind
+            ):
+                continue
+            if item_type == "compaction" and not native_compaction_eligible:
+                continue
+
+        # An item_reference requires server-side storage and cannot resolve
+        # under Hermes' store=false/manual-history contract.
+        if item_type == "item_reference":
+            continue
+
+        if item_type == "reasoning":
+            encrypted = item.get("encrypted_content")
+            if not isinstance(encrypted, str) or not encrypted:
+                continue
+            reasoning_item: Dict[str, Any] = {
+                "type": "reasoning",
+                "encrypted_content": encrypted,
+            }
+            for key in ("summary", "content"):
+                if isinstance(item.get(key), list):
+                    reasoning_item[key] = item[key]
+            reasoning_item.setdefault("summary", [])
+            replay.append(reasoning_item)
+            continue
+
+        if item_type == "compaction":
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                replay.append({"type": "compaction", "encrypted_content": encrypted})
+            continue
+
+        if item_type == "image_generation_call":
+            item_id = item.get("id")
+            result = item.get("result")
+            if (
+                not isinstance(item_id, str)
+                or not item_id
+                or not isinstance(result, str)
+                or not result
+            ):
+                continue
+            item["id"] = _clamp_responses_item_id(item_id)
+            item["status"] = "completed"
+        elif item_type == "computer_call":
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                item["id"] = _clamp_responses_item_id(item_id)
+        elif item_type in {"function_call", "custom_tool_call"}:
+            # Client-side call pairing is carried by call_id; the response
+            # item id is output-only under store=false.  Hosted-call and
+            # message ids, by contrast, are part of the original by-value
+            # output history and are retained below.
+            item.pop("id", None)
+        else:
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                item["id"] = _clamp_responses_item_id(item_id)
+
+        if item_type in {"function_call", "custom_tool_call"}:
+            item.pop("status", None)
+
+        call_id = item.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            item["call_id"] = _clamp_responses_call_id(call_id)
+
+        if item_type == "function_call":
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            item["name"] = _sanitize_replayed_fn_name(name)
+            arguments = item.get("arguments", "{}")
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif not isinstance(arguments, str):
+                arguments = str(arguments)
+            item["arguments"] = arguments or "{}"
+        elif item_type == "custom_tool_call":
+            if not isinstance(item.get("name"), str) or not item["name"].strip():
+                continue
+            if not isinstance(item.get("call_id"), str) or not item["call_id"]:
+                continue
+            tool_input = item.get("input", "")
+            item["input"] = tool_input if isinstance(tool_input, str) else str(tool_input)
+        elif item_type == "message":
+            if item.get("role") != "assistant" or not isinstance(
+                item.get("content"), list
+            ):
+                continue
+            if is_github_responses:
+                item.pop("id", None)
+        elif item_type not in _RESPONSES_REPLAY_OUTPUT_ITEM_TYPES:
+            continue
+
+        replay.append(item)
+    return replay
+
+
 def _normalize_responses_message_status(value: Any, *, default: str = "completed") -> str:
     """Normalize a Responses assistant message status for replay.
 
@@ -582,6 +905,28 @@ def _chat_messages_to_responses_input(
                 content_text = str(content) if content is not None else ""
 
             if role == "assistant":
+                # New-format exact replay: store=false means the provider will
+                # not retain this turn for us, so every item from the prior
+                # response.output must be sent back by value.  This includes
+                # hosted calls that Hermes did not dispatch locally
+                # (web_search_call, image_generation_call, MCP, shell, etc.).
+                # When the ordered snapshot exists it is authoritative for the
+                # whole assistant turn; do not also rebuild reasoning/messages/
+                # tool_calls below or the request would contain duplicates in a
+                # different order.  Legacy sessions without the sidecar retain
+                # the old reconstruction path unchanged.
+                codex_output_items = _sanitize_responses_output_items_for_replay(
+                    msg.get("codex_output_items"),
+                    is_github_responses=is_github_responses,
+                    replay_encrypted_reasoning=replay_encrypted_reasoning,
+                    current_issuer_kind=current_issuer_kind,
+                    native_compaction_eligible=native_compaction_eligible,
+                )
+                if codex_output_items:
+                    items.extend(codex_output_items)
+                    item_sources.extend([msg] * len(codex_output_items))
+                    continue
+
                 # Replay encrypted reasoning items from previous turns
                 # so the API can maintain coherent reasoning chains.
                 # This applies to every Responses transport including
@@ -1061,6 +1406,52 @@ def _preflight_codex_input_items(
             )
             continue
 
+        if item_type == "custom_tool_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise ValueError(f"Codex Responses input[{idx}] custom_tool_call is missing call_id.")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Codex Responses input[{idx}] custom_tool_call is missing name.")
+            tool_input = item.get("input", "")
+            if not isinstance(tool_input, str):
+                tool_input = str(tool_input)
+            custom_item = {
+                key: value for key, value in item.items()
+                if key not in {"id", "status", "_issuer_kind"}
+            }
+            custom_item["type"] = "custom_tool_call"
+            custom_item["call_id"] = _clamp_responses_call_id(call_id.strip())
+            custom_item["name"] = _sanitize_replayed_fn_name(name)
+            custom_item["input"] = sanitize_text(tool_input)
+            normalized.append(custom_item)
+            continue
+
+        if item_type in _RESPONSES_REPLAY_OUTPUT_ITEM_TYPES:
+            # Provider-hosted output calls are context, not local Hermes tool
+            # invocations.  Keep their complete nested payload (web-search
+            # action.sources, citations, MCP output, generated image result,
+            # shell/code metadata, etc.) while enforcing the generic wire
+            # limits that can make an otherwise valid persisted turn brick all
+            # subsequent requests.
+            hosted_item = {
+                key: value for key, value in item.items()
+                if key != "_issuer_kind"
+            }
+            hosted_item = (
+                _neutralize_harmony_structure(hosted_item)
+                if sanitize_harmony_tokens
+                else hosted_item
+            )
+            hosted_id = hosted_item.get("id")
+            if isinstance(hosted_id, str) and hosted_id:
+                hosted_item["id"] = _clamp_responses_item_id(hosted_id)
+            hosted_call_id = hosted_item.get("call_id")
+            if isinstance(hosted_call_id, str) and hosted_call_id:
+                hosted_item["call_id"] = _clamp_responses_call_id(hosted_call_id)
+            normalized.append(hosted_item)
+            continue
+
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted:
@@ -1123,7 +1514,14 @@ def _preflight_codex_input_items(
                     text = ""
                 if not isinstance(text, str):
                     text = str(text)
-                normalized_content.append({"type": "output_text", "text": sanitize_text(text)})
+                # Keep output annotations/citations/logprobs.  They are part of
+                # the response item history and can carry the source mapping
+                # for a preceding hosted web/file search.  Only normalize the
+                # two schema fields that preflight owns.
+                normalized_part = dict(part)
+                normalized_part["type"] = "output_text"
+                normalized_part["text"] = sanitize_text(text)
+                normalized_content.append(normalized_part)
             if not normalized_content:
                 raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
             normalized_item: Dict[str, Any] = {
@@ -1527,7 +1925,7 @@ def _responses_as_object(value: Any) -> Any:
 
     Streaming transports may hand us plain dicts while the official SDK hands
     typed objects. Normalization must make the same hosted-tool decision for
-    both, especially because hosted calls are intentionally ignored here.
+    both while the ordered raw output snapshot is retained for manual replay.
     """
     if isinstance(value, dict):
         return SimpleNamespace(**{
@@ -1604,6 +2002,15 @@ def _normalize_codex_response(
         error_obj = getattr(response, "error", None)
         error_msg = _format_responses_error(error_obj, response_status)
         raise RuntimeError(error_msg)
+
+    # Capture BEFORE semantic extraction.  Hosted calls are intentionally not
+    # exposed as Hermes ToolCall objects (the provider already executed them),
+    # but store=false requires that they — and every other output item — are
+    # replayed in order on the next request.
+    output_items_raw = _capture_responses_output_items(
+        output,
+        issuer_kind=issuer_kind,
+    )
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
@@ -1882,6 +2289,7 @@ def _normalize_codex_response(
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        codex_output_items=output_items_raw or None,
     )
 
     if tool_calls:
