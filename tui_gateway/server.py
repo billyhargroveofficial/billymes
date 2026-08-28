@@ -12560,6 +12560,7 @@ def _run_prompt_submit(
                     cwd=cwd,
                     allowed_root=cwd,
                     context_length=ctx_len,
+                    model=getattr(agent, "model", "") or _resolve_model(),
                 )
                 if ctx.blocked:
                     _emit(

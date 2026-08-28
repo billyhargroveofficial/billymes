@@ -121,6 +121,52 @@ def test_missing_file_becomes_warning(sample_repo: Path):
     assert "not found" in result.message.lower()
 
 
+def test_gpt_limit_can_admit_large_reference_without_inflating_model_window(
+    tmp_path: Path, monkeypatch
+):
+    """A GPT model admits 235k inside its real 272k window without inflating it."""
+    import agent.context_references as context_references
+
+    async def _large_reference(*args, **kwargs):
+        return None, "large attachment"
+
+    monkeypatch.setattr(context_references, "_expand_reference", _large_reference)
+    monkeypatch.setattr(context_references, "estimate_tokens_rough", lambda _text: 235_216)
+    result = context_references.preprocess_context_references(
+        "Review @file:large.md",
+        cwd=tmp_path,
+        context_length=272_000,
+        model="gpt-5.6-sol",
+    )
+
+    assert result.injected_tokens == 235_216
+    assert result.expanded
+    assert not result.blocked
+    assert any("80% soft limit (217600)" in warning for warning in result.warnings)
+
+
+def test_gpt_limit_still_blocks_reference_past_90_percent_hard_cap(
+    tmp_path: Path, monkeypatch
+):
+    import agent.context_references as context_references
+
+    async def _oversized_reference(*args, **kwargs):
+        return None, "oversized attachment"
+
+    monkeypatch.setattr(context_references, "_expand_reference", _oversized_reference)
+    monkeypatch.setattr(context_references, "estimate_tokens_rough", lambda _text: 244_801)
+    result = context_references.preprocess_context_references(
+        "Review @file:too-large.md",
+        cwd=tmp_path,
+        context_length=272_000,
+        model="openai/gpt-5.6-sol",
+    )
+
+    assert result.blocked
+    assert not result.expanded
+    assert any("90% hard limit (244800)" in warning for warning in result.warnings)
+
+
 def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path: Path, monkeypatch):
     """Docker backend: a staged binary attachment's host path is rendered as the
     bind-mounted in-container path so the agent's tools can read it.

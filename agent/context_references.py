@@ -89,6 +89,10 @@ _PLUGIN_REFERENCE_PATTERN = re.compile(
 
 TRAILING_PUNCTUATION = ",.;!?"
 _NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
+DEFAULT_SOFT_LIMIT_RATIO = 0.25
+DEFAULT_HARD_LIMIT_RATIO = 0.50
+GPT_SOFT_LIMIT_RATIO = 0.80
+GPT_HARD_LIMIT_RATIO = 0.90
 _SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
 _SENSITIVE_HERMES_DIRS = (Path("skills") / ".hub",)
 _SENSITIVE_HOME_FILES = (
@@ -128,6 +132,19 @@ class ContextReferenceResult:
     injected_tokens: int = 0
     expanded: bool = False
     blocked: bool = False
+
+
+def _context_reference_limit_ratios(model: str = "") -> tuple[float, float]:
+    """Return model-aware one-shot context-reference budgets.
+
+    GPT models have reliable large-context handling and Hermes already owns
+    pre-request compaction, so they may use 80%/90% of their *real* declared
+    window. Other model families retain the conservative historical limits.
+    """
+    normalized_model = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if normalized_model.startswith("gpt-"):
+        return GPT_SOFT_LIMIT_RATIO, GPT_HARD_LIMIT_RATIO
+    return DEFAULT_SOFT_LIMIT_RATIO, DEFAULT_HARD_LIMIT_RATIO
 
 
 def format_reference_value(value: str) -> str:
@@ -214,6 +231,7 @@ def preprocess_context_references(
     *,
     cwd: str | Path,
     context_length: int,
+    model: str = "",
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
 ) -> ContextReferenceResult:
@@ -221,6 +239,7 @@ def preprocess_context_references(
         message,
         cwd=cwd,
         context_length=context_length,
+        model=model,
         url_fetcher=url_fetcher,
         allowed_root=allowed_root,
     )
@@ -241,6 +260,7 @@ async def preprocess_context_references_async(
     *,
     cwd: str | Path,
     context_length: int,
+    model: str = "",
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
 ) -> ContextReferenceResult:
@@ -282,11 +302,13 @@ async def preprocess_context_references_async(
             blocks.append(block)
             injected_tokens += estimate_tokens_rough(block)
 
-    hard_limit = max(1, int(context_length * 0.50))
-    soft_limit = max(1, int(context_length * 0.25))
+    soft_limit_ratio, hard_limit_ratio = _context_reference_limit_ratios(model)
+    hard_limit = max(1, int(context_length * hard_limit_ratio))
+    soft_limit = max(1, int(context_length * soft_limit_ratio))
     if injected_tokens > hard_limit:
         warnings.append(
-            f"@ context injection refused: {injected_tokens} tokens exceeds the 50% hard limit ({hard_limit})."
+            f"@ context injection refused: {injected_tokens} tokens exceeds the "
+            f"{hard_limit_ratio:.0%} hard limit ({hard_limit})."
         )
         return ContextReferenceResult(
             message=message,
@@ -300,7 +322,8 @@ async def preprocess_context_references_async(
 
     if injected_tokens > soft_limit:
         warnings.append(
-            f"@ context injection warning: {injected_tokens} tokens exceeds the 25% soft limit ({soft_limit})."
+            f"@ context injection warning: {injected_tokens} tokens exceeds the "
+            f"{soft_limit_ratio:.0%} soft limit ({soft_limit})."
         )
 
     # Leave the `@file:`/`@folder:` tokens where the user typed them. The token

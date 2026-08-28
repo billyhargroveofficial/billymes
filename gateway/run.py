@@ -19162,6 +19162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     cwd=_msg_cwd,
                     context_length=_msg_ctx_len,
+                    model=_msg_model,
                     allowed_root=_msg_cwd,
                 )
                 if _ctx_result.blocked:

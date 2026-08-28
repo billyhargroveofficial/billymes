@@ -16448,7 +16448,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     provider=self.provider or "",
                     config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
                 _ctx_result = preprocess_context_references(
-                    message, cwd=os.getcwd(), context_length=_ctx_len)
+                    message,
+                    cwd=os.getcwd(),
+                    context_length=_ctx_len,
+                    model=self.model,
+                )
                 if _ctx_result.expanded or _ctx_result.blocked:
                     if _ctx_result.references:
                         _cprint(
