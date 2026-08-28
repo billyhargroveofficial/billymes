@@ -145,7 +145,12 @@ def get_sessions(
             # with the serving profile even when the request wasn't explicitly
             # scoped, so default-profile rows never circulate unowned.
             row_profile = profile_name or _cron_default_profile()
+            try:
+                turn_counts = db.count_user_messages([s.get("id") for s in sessions])
+            except Exception:
+                turn_counts = {}
             for s in sessions:
+                s["turn_count"] = turn_counts.get(s.get("id"), 0)
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300

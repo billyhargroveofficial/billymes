@@ -221,6 +221,25 @@ class SessionPortabilityMixin:
         """
         return self._get_session_rich_row(session_id, compact_rows=compact_rows)
 
+    def count_user_messages(self, session_ids):
+        """Per-session count of user-role messages (the turn count).
+
+        One grouped query for a whole listing page; ids absent from the
+        result simply have no user messages yet.
+        """
+        ids = [sid for sid in session_ids if sid]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, COUNT(*) AS n FROM messages "
+                f"WHERE role = ? AND session_id IN ({placeholders}) "
+                "GROUP BY session_id",
+                ["user", *ids],
+            ).fetchall()
+        return {row["session_id"]: row["n"] for row in rows}
+
     def list_skill_scaffolded_sessions(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Titled sessions whose first user turn was a ``/skill`` invocation.
 

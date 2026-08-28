@@ -301,6 +301,22 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_count_user_messages_groups_requested_sessions(self, db):
+        db.create_session("s1", source="cli")
+        db.create_session("s2", source="telegram")
+        db.create_session("empty", source="cli")
+        db.append_message("s1", role="user", content="first")
+        db.append_message("s1", role="assistant", content="answer")
+        db.append_message("s1", role="user", content="second")
+        db.append_message("s2", role="user", content="only")
+        db.append_message("s2", role="tool", content="tool output")
+
+        assert db.count_user_messages(["s1", "s2", "empty", "missing"]) == {
+            "s1": 2,
+            "s2": 1,
+        }
+        assert db.count_user_messages([]) == {}
+
 
     def test_branch_resume_does_not_include_parent_messages_added_after_fork(self, db):
         """A branch owns its copied transcript, not the parent's later turns."""

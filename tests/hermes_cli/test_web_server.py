@@ -399,6 +399,26 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_get_sessions_exposes_user_turn_count(self):
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session("counted", source="cli")
+            db.append_message("counted", role="user", content="first")
+            db.append_message("counted", role="assistant", content="answer")
+            db.append_message("counted", role="user", content="second")
+            db.append_message("counted", role="tool", content="tool output")
+        finally:
+            db.close()
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        rows = {row["id"]: row for row in response.json()["sessions"]}
+        assert rows["counted"]["turn_count"] == 2
+
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]
     )
