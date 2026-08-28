@@ -15,6 +15,7 @@ Run with:  python -m pytest tests/test_code_execution.py -v
 import pytest
 # pytestmark removed — tests run fine (61 pass, ~99s)
 
+import base64
 import json
 import os
 import socket
@@ -140,14 +141,6 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("os.path.join(tempfile.gettempdir(), \"hermes_rpc\")", src)
         self.assertNotIn('os.environ.get("HERMES_RPC_DIR", "/tmp/hermes_rpc")', src)
 
-    def test_uds_transport_serializes_concurrent_calls(self):
-        """Regression: UDS _call() must hold a lock across send+recv so that
-        concurrent tool calls from multiple threads don't interleave on the
-        shared socket and receive each other's responses."""
-        src = generate_hermes_tools_module(["terminal"], transport="uds")
-        self.assertIn("_call_lock = threading.Lock()", src)
-        self.assertIn("with _call_lock:", src)
-
     def test_file_transport_serializes_seq_allocation(self):
         """Regression: file transport _call() must allocate `_seq` under a
         lock, otherwise concurrent threads can pick the same seq and clobber
@@ -155,6 +148,43 @@ class TestHermesToolsGeneration(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="file")
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
+
+
+class TestRpcDispatchState(unittest.TestCase):
+    def test_tool_call_limit_is_reserved_atomically(self):
+        from tools.code_execution_tool import _RpcDispatchState
+
+        counter = [0]
+        state = _RpcDispatchState(
+            tool_call_counter=counter,
+            tool_call_log=[],
+            max_tool_calls=1,
+            max_parallel_tool_calls=10,
+            stop_event=threading.Event(),
+        )
+        rendezvous = threading.Barrier(10)
+        results = []
+        results_lock = threading.Lock()
+
+        def reserve_once():
+            rendezvous.wait(timeout=10)
+            result = state.reserve()
+            with results_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=reserve_once) for _ in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(result is None for result in results), 1)
+        self.assertEqual(counter, [1])
+        self.assertTrue(all(
+            result is None or "limit reached" in result.lower()
+            for result in results
+        ))
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
@@ -353,6 +383,75 @@ else:
         self.assertEqual(result["status"], "success", msg=result)
         self.assertIn("OK 10/10", result["output"],
                       msg=f"Concurrent tool calls mismatched: {result['output']!r}")
+
+    def test_parallel_safe_nested_calls_are_simultaneously_in_flight(self):
+        """Ten web calls must reach the dispatcher together, not merely return
+        correctly after hidden RPC serialization."""
+        code = '''
+from concurrent.futures import ThreadPoolExecutor
+from hermes_tools import web_search
+
+tags = [f"query-{index}" for index in range(10)]
+with ThreadPoolExecutor(max_workers=10) as pool:
+    results = list(pool.map(lambda tag: web_search(tag), tags))
+print("OK", len(results), [item.get("tag") for item in results])
+'''
+        rendezvous = threading.Barrier(10)
+
+        def overlapping_mock(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "web_search":
+                rendezvous.wait(timeout=10)
+                return json.dumps({"tag": function_args["query"]})
+            return _mock_handle_function_call(
+                function_name,
+                function_args,
+                task_id=task_id,
+                user_task=user_task,
+            )
+
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        starts = []
+        completes = []
+        with (
+            patch(
+                "tools.code_execution_tool._load_config",
+                return_value={
+                    "timeout": 30,
+                    "max_tool_calls": 50,
+                    "max_parallel_tool_calls": 10,
+                },
+            ),
+            patch(
+                "model_tools.handle_function_call",
+                side_effect=overlapping_mock,
+            ),
+            nested_tool_presentation_scope(
+                parent_tool_call_id="call_parallel_outer",
+                start_callback=lambda *args: starts.append(args),
+                complete_callback=lambda *args: completes.append(args),
+            ),
+        ):
+            result = json.loads(
+                execute_code(
+                    code=code,
+                    task_id="test-real-parallel",
+                    enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                )
+            )
+
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertEqual(result["tool_calls_made"], 10)
+        self.assertIn("OK 10", result["output"])
+        self.assertIn("query-0", result["output"])
+        self.assertIn("query-9", result["output"])
+        self.assertEqual(len(starts), 10)
+        self.assertEqual(len(completes), 10)
+        start_ids = [event[0] for event in starts]
+        complete_ids = [event[0] for event in completes]
+        self.assertEqual(len(set(start_ids)), 10)
+        self.assertEqual(set(start_ids), set(complete_ids))
+        self.assertEqual(len(complete_ids), len(set(complete_ids)))
 
 
     def test_stderr_on_error(self):
@@ -838,27 +937,30 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         """
         from tools.code_execution_tool import _rpc_server_loop
 
-        # socketpair gives us a connected client end and a "server" end we
-        # can hand to accept() by wrapping it in a tiny listener shim.
-        srv, cli = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        # One socketpair per request mirrors the generated per-call client.
+        # The listener shim presents each server end through accept().
+        pairs = [
+            socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            for _ in requests
+        ]
+        server_ends = [pair[0] for pair in pairs]
+        clients = [pair[1] for pair in pairs]
 
         class _OneShotListener:
             """Minimal object exposing the .accept()/.settimeout() the loop uses."""
 
-            def __init__(self, conn):
-                self._conn = conn
-                self._served = False
+            def __init__(self, connections):
+                self._connections = list(connections)
 
             def settimeout(self, _t):
                 pass
 
             def accept(self):
-                if self._served:
+                if not self._connections:
                     raise socket.timeout()
-                self._served = True
-                return self._conn, ("peer", 0)
+                return self._connections.pop(0), ("peer", 0)
 
-        listener = _OneShotListener(srv)
+        listener = _OneShotListener(server_ends)
         stop_event = threading.Event()
         tool_call_log = []
         tool_call_counter = [0]
@@ -879,29 +981,34 @@ class TestRpcTokenAuthorization(unittest.TestCase):
                     rpc_token=rpc_token,
                 )
 
-        t = threading.Thread(target=_run, daemon=True)
+        from tools.thread_context import propagate_context_to_thread
+
+        t = threading.Thread(
+            target=propagate_context_to_thread(_run),
+            daemon=True,
+        )
         t.start()
 
         responses = []
         try:
-            for req in requests:
-                cli.sendall((json.dumps(req) + "\n").encode())
-            cli.settimeout(5)
-            buf = b""
-            while len(responses) < len(requests):
-                chunk = cli.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if line:
-                        responses.append(json.loads(line.decode()))
+            for client, req in zip(clients, requests):
+                client.sendall((json.dumps(req) + "\n").encode())
+            for client in clients:
+                client.settimeout(5)
+                buf = b""
+                while True:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if buf.strip():
+                    responses.append(json.loads(buf.decode().strip()))
         finally:
             stop_event.set()
-            cli.close()
-            srv.close()
+            for client in clients:
+                client.close()
+            for server_end in server_ends:
+                server_end.close()
             t.join(timeout=5)
         return responses
 
@@ -912,6 +1019,314 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         )
         self.assertEqual(len(resp), 1)
         self.assertIn("Unauthorized", resp[0].get("error", ""))
+
+    def test_authorized_rpc_projects_each_real_nested_dispatch(self):
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        progress = []
+        starts = []
+        completes = []
+        requests = [
+            {
+                "tool": "terminal",
+                "args": {"command": "printf one"},
+                "token": "secret-token",
+            },
+            {
+                "tool": "terminal",
+                "args": {"command": "printf two"},
+                "token": "secret-token",
+            },
+        ]
+        with nested_tool_presentation_scope(
+            parent_tool_call_id="call_outer",
+            progress_callback=lambda *a, **kw: progress.append((a, kw)),
+            start_callback=lambda *a: starts.append(a),
+            complete_callback=lambda *a: completes.append(a),
+        ):
+            responses = self._drive_server("secret-token", requests)
+
+        self.assertEqual(len(responses), 2)
+        self.assertEqual([event[1] for event in starts], ["terminal", "terminal"])
+        self.assertEqual(len({event[0] for event in starts}), 2)
+        self.assertEqual([event[0][0] for event in progress], [
+            "tool.started",
+            "tool.completed",
+            "tool.started",
+            "tool.completed",
+        ])
+        self.assertEqual(len(completes), 2)
+        self.assertTrue(all(
+            json.loads(event[3]) == {"status": "completed"}
+            for event in completes
+        ))
+
+    def test_rejected_rpc_request_has_no_nested_lifecycle(self):
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        starts = []
+        with nested_tool_presentation_scope(
+            parent_tool_call_id="call_outer",
+            start_callback=lambda *a: starts.append(a),
+        ):
+            responses = self._drive_server(
+                "secret-token",
+                [{"tool": "terminal", "args": {"command": "id"}}],
+            )
+
+        self.assertIn("Unauthorized", responses[0].get("error", ""))
+        self.assertEqual(starts, [])
+
+    def test_remote_rpc_projects_the_same_single_dispatch_lifecycle(self):
+        from tools.code_execution_tool import _rpc_poll_loop
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        stop_event = threading.Event()
+        request_path = "/rpc/req_000001"
+        request = {
+            "seq": 1,
+            "tool": "terminal",
+            "args": {"command": "printf remote"},
+            "token": "secret-token",
+        }
+
+        class FakeEnv:
+            def __init__(self):
+                self.response_commands = []
+
+            def execute(self, command, cwd=None, timeout=None):
+                del cwd, timeout
+                if command.startswith("ls -1 "):
+                    return {"output": request_path}
+                if command == f"cat {request_path}":
+                    return {"output": json.dumps(request)}
+                if "base64 -d" in command and "/rpc/res_000001" in command:
+                    self.response_commands.append(command)
+                    stop_event.set()
+                    return {"output": ""}
+                if command.startswith("rm -f "):
+                    return {"output": ""}
+                raise AssertionError(f"unexpected remote command: {command}")
+
+        starts = []
+        completes = []
+        env = FakeEnv()
+        with (
+            nested_tool_presentation_scope(
+                parent_tool_call_id="call_outer",
+                start_callback=lambda *a: starts.append(a),
+                complete_callback=lambda *a: completes.append(a),
+            ),
+            patch(
+                "model_tools.handle_function_call",
+                return_value=json.dumps({"output": "remote ok", "exit_code": 0}),
+            ) as dispatch,
+        ):
+            _rpc_poll_loop(
+                env,
+                "/rpc",
+                "test-task",
+                [],
+                [0],
+                max_tool_calls=10,
+                allowed_tools=frozenset({"terminal"}),
+                stop_event=stop_event,
+                rpc_token="secret-token",
+            )
+
+        dispatch.assert_called_once_with(
+            "terminal",
+            {"command": "printf remote"},
+            task_id="test-task",
+        )
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][1], "terminal")
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(json.loads(completes[0][3]), {"status": "completed"})
+        self.assertEqual(len(env.response_commands), 1)
+
+    def test_remote_rpc_dispatches_parallel_safe_requests_concurrently(self):
+        from tools.code_execution_tool import _rpc_poll_loop
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        stop_event = threading.Event()
+        requests = {
+            "/rpc/req_000001": {
+                "seq": 1,
+                "tool": "web_search",
+                "args": {"query": "alpha", "limit": 1},
+                "token": "secret-token",
+            },
+            "/rpc/req_000002": {
+                "seq": 2,
+                "tool": "web_search",
+                "args": {"query": "beta", "limit": 1},
+                "token": "secret-token",
+            },
+        }
+
+        class FakeEnv:
+            def __init__(self):
+                self.removed = set()
+                self.response_commands = []
+                self.responses = {}
+
+            def execute(self, command, cwd=None, timeout=None):
+                del cwd, timeout
+                if command.startswith("ls -1 "):
+                    pending = [
+                        path for path in requests if path not in self.removed
+                    ]
+                    return {"output": "\n".join(pending)}
+                if command.startswith("cat "):
+                    path = command[4:]
+                    return {"output": json.dumps(requests[path])}
+                if "base64 -d" in command and "/rpc/res_" in command:
+                    self.response_commands.append(command)
+                    encoded = command.split("echo '", 1)[1].split("'", 1)[0]
+                    decoded = base64.b64decode(encoded).decode("utf-8")
+                    response_path = next(
+                        path
+                        for path in ("/rpc/res_000001", "/rpc/res_000002")
+                        if path in command
+                    )
+                    self.responses[response_path] = json.loads(decoded)
+                    if len(self.response_commands) == len(requests):
+                        stop_event.set()
+                    return {"output": ""}
+                if command.startswith("rm -f "):
+                    self.removed.add(command[len("rm -f "):])
+                    return {"output": ""}
+                raise AssertionError(f"unexpected remote command: {command}")
+
+        rendezvous = threading.Barrier(2)
+
+        def overlapping_dispatch(name, args, task_id=None):
+            self.assertEqual(name, "web_search")
+            rendezvous.wait(timeout=10)
+            return json.dumps({"query": args["query"]})
+
+        starts = []
+        completes = []
+        env = FakeEnv()
+        with (
+            nested_tool_presentation_scope(
+                parent_tool_call_id="call_outer",
+                start_callback=lambda *args: starts.append(args),
+                complete_callback=lambda *args: completes.append(args),
+            ),
+            patch(
+                "model_tools.handle_function_call",
+                side_effect=overlapping_dispatch,
+            ) as dispatch,
+        ):
+            _rpc_poll_loop(
+                env,
+                "/rpc",
+                "test-task",
+                [],
+                [0],
+                max_tool_calls=10,
+                allowed_tools=frozenset({"web_search"}),
+                stop_event=stop_event,
+                rpc_token="secret-token",
+                max_parallel_tool_calls=2,
+            )
+
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len({event[0] for event in starts}), 2)
+        self.assertEqual(len(completes), 2)
+        self.assertEqual(len(env.response_commands), 2)
+        self.assertTrue(any("/rpc/res_000001" in cmd for cmd in env.response_commands))
+        self.assertTrue(any("/rpc/res_000002" in cmd for cmd in env.response_commands))
+        self.assertEqual(env.responses["/rpc/res_000001"], {"query": "alpha"})
+        self.assertEqual(env.responses["/rpc/res_000002"], {"query": "beta"})
+
+    def test_remote_rpc_reader_waits_for_concurrent_terminal_mutation(self):
+        """Remote file RPC gives read_file the terminal's committed view."""
+        from tools.code_execution_tool import _rpc_poll_loop
+
+        stop_event = threading.Event()
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        reader_started = threading.Event()
+        workspace = {"content": "before"}
+        requests = {
+            "/rpc/req_000001": {
+                "seq": 1,
+                "tool": "terminal",
+                "args": {"command": "write target"},
+                "token": "secret-token",
+            },
+            "/rpc/req_000002": {
+                "seq": 2,
+                "tool": "read_file",
+                "args": {"path": "target.txt"},
+                "token": "secret-token",
+            },
+        }
+
+        class FakeEnv:
+            def __init__(self):
+                self.removed = set()
+                self.responses = {}
+
+            def execute(self, command, cwd=None, timeout=None):
+                del cwd, timeout
+                if command.startswith("ls -1 "):
+                    pending = [path for path in requests if path not in self.removed]
+                    return {"output": "\n".join(pending)}
+                if command.startswith("cat "):
+                    return {"output": json.dumps(requests[command[4:]])}
+                if "base64 -d" in command and "/rpc/res_" in command:
+                    encoded = command.split("echo '", 1)[1].split("'", 1)[0]
+                    response_path = next(
+                        path
+                        for path in ("/rpc/res_000001", "/rpc/res_000002")
+                        if path in command
+                    )
+                    self.responses[response_path] = json.loads(
+                        base64.b64decode(encoded).decode("utf-8")
+                    )
+                    if len(self.responses) == 2:
+                        stop_event.set()
+                    return {"output": ""}
+                if command.startswith("rm -f "):
+                    self.removed.add(command[len("rm -f "):])
+                    return {"output": ""}
+                raise AssertionError(f"unexpected remote command: {command}")
+
+        def dispatch(name, _args, task_id=None):
+            self.assertEqual(task_id, "test-task")
+            if name == "terminal":
+                writer_started.set()
+                self.assertTrue(release_writer.wait(timeout=5))
+                workspace["content"] = "after"
+                return json.dumps({"output": "written"})
+            if name == "read_file":
+                reader_started.set()
+                return json.dumps({"content": workspace["content"]})
+            self.fail(f"unexpected RPC tool: {name}")
+
+        env = FakeEnv()
+        runner = threading.Thread(
+            target=_rpc_poll_loop,
+            args=(
+                env, "/rpc", "test-task", [], [0], 10,
+                frozenset({"terminal", "read_file"}), stop_event,
+                "secret-token", 2,
+            ),
+            daemon=True,
+        )
+        with patch("model_tools.handle_function_call", side_effect=dispatch):
+            runner.start()
+            self.assertTrue(writer_started.wait(timeout=5))
+            self.assertFalse(reader_started.wait(timeout=0.25))
+            release_writer.set()
+            runner.join(timeout=10)
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(env.responses["/rpc/res_000002"], {"content": "after"})
 
 
     def test_generated_module_sends_token(self):

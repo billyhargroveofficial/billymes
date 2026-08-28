@@ -74,11 +74,13 @@ def _cell(status="ok", stdout="", execution_count=1, **kw):
     return payload
 
 
-def _run(env, code="print(1)", *, task="t1", reset=False, timeout=10):
+def _run(env, code="print(1)", *, task="t1", reset=False, timeout=10,
+         max_parallel_tool_calls=10):
     return execute_in_remote_kernel(
         code, env=env, env_type="ssh", task_env_id=task,
         sandbox_tools=frozenset({"read_file"}), timeout=timeout,
         max_tool_calls=5, reset=reset,
+        max_parallel_tool_calls=max_parallel_tool_calls,
     )
 
 
@@ -94,7 +96,7 @@ class RemoteKernelBase(unittest.TestCase):
         self._poll = patch(
             "tools.code_execution_tool._rpc_poll_loop",
         )
-        self._poll.start()
+        self._poll_mock = self._poll.start()
 
     def tearDown(self):
         self._ship.stop()
@@ -117,6 +119,13 @@ class TestSpawnAndReuse(RemoteKernelBase):
         self.assertEqual(
             sum(1 for c in env.commands if "nohup" in c), 1,
         )
+
+    def test_per_cell_rpc_uses_configured_parallel_limit(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(stdout="ok\n")]))
+        result = _run(env, max_parallel_tool_calls=3)
+        self.assertEqual(result["status"], "success", result)
+        self._poll_mock.assert_called_once()
+        self.assertEqual(self._poll_mock.call_args.args[-1], 3)
 
     def test_spawn_failure_fails_open(self):
         env = ScriptedEnv([

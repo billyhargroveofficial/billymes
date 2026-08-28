@@ -163,27 +163,29 @@ Switching mode changes where scripts run and which interpreter runs them, not wh
 | **Stdout** | 50 KB | Output truncated with `[output truncated at 50KB]` notice |
 | **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
 | **Tool calls** | 50 per execution | Error returned when limit reached |
+| **Parallel tool calls** | 10 per execution | Read/web calls overlap; terminal and file mutations remain ordered |
 
 All limits are configurable via `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
 code_execution:
-  mode: project      # project (default) | strict
-  timeout: 300       # Max seconds per script (default: 300)
-  max_tool_calls: 50 # Max tool calls per execution (default: 50)
+  mode: project               # project (default) | strict
+  timeout: 300                # Max seconds per script (default: 300)
+  max_tool_calls: 50          # Max tool calls per execution (default: 50)
+  max_parallel_tool_calls: 10 # Concurrent read/web calls (1-32)
 ```
 
 ## How Tool Calls Work Inside Scripts
 
 When your script calls a function like `web_search("query")`:
 
-1. The call is serialized to JSON and sent over a Unix domain socket to the parent process
-2. The parent dispatches through the standard `handle_function_call` handler
-3. The result is sent back over the socket
+1. The call is serialized to JSON and sent over its own Unix-domain/TCP connection (or a request file on remote backends)
+2. The parent dispatches through the standard `handle_function_call` handler on a bounded worker pool
+3. The result returns over the same connection/request ID, so concurrent calls cannot swap responses
 4. The function returns the parsed result
 
-This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
+This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. `web_search`, `web_extract`, `read_file`, and `search_files` may overlap up to the configured limit. Stateful or mutating calls (`terminal`, `write_file`, and `patch`) stay on one ordered lane. `terminal()` is foreground-only (no `background` or `pty` parameters).
 
 ## Error Handling
 

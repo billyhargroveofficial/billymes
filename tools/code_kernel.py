@@ -217,11 +217,23 @@ class CellAuthority:
                 "No active execute_code cell: the cell this kernel call "
                 "belonged to has settled, so its tool authority is retired."
             )
-        return self.ctx.run(self._invoke, tool_name, tool_args)
+        # One cell may issue parallel read-only RPC calls. A Context cannot
+        # be entered by two threads at once, so each worker receives a copy
+        # of the cell snapshot (including the nested-tool observer).
+        return self.ctx.copy().run(self._invoke, tool_name, tool_args)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
+        from tools.nested_tool_presentation import current_nested_tool_presentation
 
+        presentation = current_nested_tool_presentation()
+        presentation_call_id = (
+            presentation.start(tool_name, tool_args)
+            if presentation is not None
+            else None
+        )
+        result = None
+        dispatch_failed = False
         previous = None
         if self._callback_setters is not None:
             try:
@@ -234,8 +246,18 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            result = handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return result
+        except Exception:
+            dispatch_failed = True
+            raise
         finally:
+            if presentation is not None:
+                presentation.finish(
+                    presentation_call_id,
+                    result,
+                    force_error=dispatch_failed,
+                )
             if previous is not None and self._callback_setters is not None:
                 set_approval, set_sudo = self._callback_setters
                 try:
@@ -425,7 +447,7 @@ def _teardown(kernel: SessionKernel) -> None:
 
 
 def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
-                 sandbox_tools: frozenset) -> None:
+                 max_parallel_tool_calls: int, sandbox_tools: frozenset) -> None:
     """Serve tool RPC for the kernel's whole life.
 
     ``_rpc_server_loop`` serves one connection and returns on disconnect or
@@ -461,6 +483,7 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
             kernel.stop_event,
             kernel.rpc_token,
             dispatch=_dispatch,
+            max_parallel_tool_calls=max_parallel_tool_calls,
         )
 
 
@@ -544,7 +567,8 @@ def _stderr_reader(kernel: SessionKernel) -> None:
 
 
 def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
-           child_cwd: str, sandbox_tools: frozenset, max_tool_calls: int) -> None:
+           child_cwd: str, sandbox_tools: frozenset, max_tool_calls: int,
+           max_parallel_tool_calls: int) -> None:
     from tools.code_execution_tool import (
         _build_child_env,
         generate_hermes_tools_module,
@@ -568,7 +592,7 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
         server_sock.bind(kernel.sock_path)
         os.chmod(kernel.sock_path, 0o600)
         rpc_endpoint = kernel.sock_path
-    server_sock.listen(1)
+    server_sock.listen(max_parallel_tool_calls)
     kernel.server_sock = server_sock
 
     tools_src = generate_hermes_tools_module(list(sandbox_tools))
@@ -611,7 +635,7 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
     # kernel's whole life. Authority is rebound per cell via CellAuthority.
     threading.Thread(
         target=_rpc_forever,
-        args=(kernel, max_tool_calls, sandbox_tools),
+        args=(kernel, max_tool_calls, max_parallel_tool_calls, sandbox_tools),
         daemon=True,
     ).start()
     threading.Thread(target=_stdout_reader, args=(kernel,), daemon=True).start()
@@ -638,6 +662,7 @@ def execute_in_session_kernel(
     sandbox_tools: frozenset,
     timeout: int,
     max_tool_calls: int,
+    max_parallel_tool_calls: int,
     reset: bool,
     is_interrupted,
 ) -> str:
@@ -694,6 +719,7 @@ def execute_in_session_kernel(
                     child_cwd=child_cwd,
                     sandbox_tools=sandbox_tools,
                     max_tool_calls=max_tool_calls,
+                    max_parallel_tool_calls=max_parallel_tool_calls,
                 )
             assert kernel.proc is not None and kernel.proc.stdin is not None
 

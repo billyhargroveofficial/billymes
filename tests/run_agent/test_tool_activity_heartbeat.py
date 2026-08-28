@@ -11,6 +11,7 @@ periodically while a tool call is in flight.
 """
 
 import json
+from contextlib import contextmanager
 import threading
 import time
 from unittest.mock import MagicMock
@@ -195,6 +196,47 @@ def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
     n = len(touches)
     time.sleep(0.12)  # several heartbeat intervals
     assert len(touches) == n, "heartbeat thread kept running after tool returned"
+
+
+def test_execute_code_binds_nested_presentation_only_around_dispatch(monkeypatch):
+    """The shared executor chokepoint binds the RPC observer for execute_code."""
+    import agent.tool_executor as te
+
+    agent = _make_agent(monkeypatch)
+    agent._tool_guardrails = MagicMock(
+        before_call=lambda name, args: MagicMock(allows_execution=True)
+    )
+    progress = lambda *_a, **_kw: None
+    start = lambda *_a, **_kw: None
+    complete = lambda *_a, **_kw: None
+    agent.tool_progress_callback = progress
+    agent.tool_start_callback = start
+    agent.tool_complete_callback = complete
+    scopes = []
+
+    @contextmanager
+    def fake_scope(**kwargs):
+        scopes.append(kwargs)
+        yield
+
+    monkeypatch.setattr(te, "nested_tool_presentation_scope", fake_scope)
+    outcome = te._run_agent_tool_execution_middleware(
+        agent,
+        function_name="execute_code",
+        function_args={"code": "print('ok')"},
+        effective_task_id="task",
+        tool_call_id="call_outer",
+        execute=lambda _args: json.dumps({"status": "success"}),
+        display_index=1,
+    )
+
+    assert json.loads(outcome.result) == {"status": "success"}
+    assert scopes == [{
+        "parent_tool_call_id": "call_outer",
+        "progress_callback": progress,
+        "start_callback": start,
+        "complete_callback": complete,
+    }]
 
 
 def test_heartbeat_stops_when_execute_raises(monkeypatch):

@@ -46,6 +46,7 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
+from tools.nested_tool_presentation import nested_tool_presentation_scope
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -729,6 +730,14 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
+            if function_name == "execute_code":
+                with nested_tool_presentation_scope(
+                    parent_tool_call_id=tool_call_id,
+                    progress_callback=getattr(agent, "tool_progress_callback", None),
+                    start_callback=getattr(agent, "tool_start_callback", None),
+                    complete_callback=getattr(agent, "tool_complete_callback", None),
+                ):
+                    return execute(final_args)
             return execute(final_args)
         finally:
             _hb_stop.set()

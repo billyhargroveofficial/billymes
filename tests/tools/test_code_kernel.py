@@ -19,6 +19,8 @@ tests patch ``_load_config`` directly, mirroring test_code_execution_modes.
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -384,6 +386,99 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         self.assertEqual(second["status"], "success", second)
         self.assertEqual(len(seen), 1)
         self.assertIs(seen[0]["approval_cb"], cb_two)
+
+    def test_parallel_nested_calls_copy_authority_context_and_emit_lifecycle(self):
+        """A persistent cell can render concurrent nested calls safely."""
+        from tools.nested_tool_presentation import nested_tool_presentation_scope
+
+        events = []
+        events_lock = threading.Lock()
+
+        def start(call_id, name, _args):
+            with events_lock:
+                events.append(("start", call_id, name))
+
+        def complete(call_id, name, _args, result):
+            with events_lock:
+                events.append(("complete", call_id, name, result))
+
+        def slow_handle(_name, _args, task_id=None, user_task=None):
+            time.sleep(0.03)
+            return json.dumps({"ok": True, "task_id": task_id})
+
+        code = (
+            "import hermes_tools\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "with ThreadPoolExecutor(max_workers=2) as pool:\n"
+            "    list(pool.map(lambda n: hermes_tools.web_search(query=str(n)), range(2)))\n"
+        )
+        with _kernel_config(), patch(
+            "model_tools.handle_function_call", new=slow_handle
+        ), nested_tool_presentation_scope(
+            parent_tool_call_id="outer-session",
+            start_callback=start,
+            complete_callback=complete,
+        ):
+            result = _run(code)
+
+        self.assertEqual(result["status"], "success", result)
+        starts = [event for event in events if event[0] == "start"]
+        completes = [event for event in events if event[0] == "complete"]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(completes), 2)
+        self.assertEqual({event[1] for event in starts}, {event[1] for event in completes})
+        self.assertTrue(all(event[3] == '{"status": "completed"}' for event in completes))
+
+    def test_terminal_finishes_before_concurrent_read_file_observes_workspace(self):
+        """A stateful RPC excludes a concurrent reader in a session kernel."""
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        reader_started = threading.Event()
+        state = {"content": "before"}
+        result_box = {}
+
+        def dispatch(name, _args, task_id=None):
+            self.assertEqual(task_id, "kernel-test")
+            if name == "terminal":
+                writer_started.set()
+                self.assertTrue(release_writer.wait(timeout=5))
+                state["content"] = "after"
+                return json.dumps({"output": "written", "exit_code": 0})
+            if name == "read_file":
+                reader_started.set()
+                return json.dumps({"content": state["content"]})
+            self.fail(f"unexpected RPC tool: {name}")
+
+        code = (
+            "import time\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from hermes_tools import terminal, read_file\n"
+            "with ThreadPoolExecutor(max_workers=2) as pool:\n"
+            "    writer = pool.submit(terminal, 'write target')\n"
+            "    time.sleep(0.08)\n"
+            "    reader = pool.submit(read_file, 'target.txt')\n"
+            "    writer.result()\n"
+            "    print(reader.result()['content'])\n"
+        )
+
+        def run_cell():
+            with _kernel_config(max_parallel_tool_calls=2), patch(
+                "model_tools.handle_function_call", side_effect=dispatch
+            ):
+                result_box["result"] = _run(code)
+
+        runner = threading.Thread(target=run_cell, daemon=True)
+        runner.start()
+        self.assertTrue(writer_started.wait(timeout=5))
+        # The read RPC was submitted by the child, but must wait until the
+        # terminal mutation commits rather than racing and seeing "before".
+        self.assertFalse(reader_started.wait(timeout=0.25))
+        release_writer.set()
+        runner.join(timeout=10)
+        self.assertFalse(runner.is_alive())
+        result = result_box["result"]
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("after", result["output"])
 
     def test_a_settled_cells_authority_refuses_dispatch(self):
         from tools.code_kernel import CellAuthority

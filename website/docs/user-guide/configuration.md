@@ -2298,6 +2298,7 @@ code_execution:
   mode: project                # project (default) | strict
   timeout: 300                 # Max execution time in seconds
   max_tool_calls: 50           # Max tool calls within code execution
+  max_parallel_tool_calls: 10  # Concurrent read/web calls (hard cap: 32)
 ```
 
 **`mode`** controls the working directory and Python interpreter for scripts:

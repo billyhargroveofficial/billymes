@@ -24,7 +24,7 @@ Architecture (two transports):
 In both cases, only the script's stdout is returned to the LLM; intermediate
 tool results never enter the context window.
 
-Platform: Linux / macOS only (Unix domain sockets for local). Disabled on Windows.
+Platform: Linux / macOS use Unix domain sockets; Windows uses loopback TCP.
 Remote execution additionally requires Python 3 in the terminal backend.
 """
 
@@ -73,6 +73,8 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MAX_PARALLEL_TOOL_CALLS = 10
+MAX_PARALLEL_TOOL_CALLS = 32
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
@@ -564,14 +566,7 @@ def retry(fn, max_attempts=3, delay=2):
 
 _UDS_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs."""
-import json, os, socket, shlex, threading, time
-
-_sock = None
-# The RPC server handles a single client connection serially and has no
-# request-id in the protocol, so concurrent _call() invocations from multiple
-# threads (e.g. ThreadPoolExecutor) would race on the shared socket and get
-# each other's responses. Serialize the entire send+recv round-trip.
-_call_lock = threading.Lock()
+import json, os, socket, shlex, time
 ''' + _COMMON_HELPERS + '''\
 
 def _connect():
@@ -583,21 +578,24 @@ def _connect():
       - a string of the form ``tcp://127.0.0.1:<port>`` (Windows, where
         AF_UNIX is unreliable — the parent falls back to loopback TCP)
     """
-    global _sock
-    if _sock is None:
-        endpoint = os.environ["HERMES_RPC_SOCKET"]
-        if endpoint.startswith("tcp://"):
-            # tcp://host:port  (host is always 127.0.0.1 in practice — we
-            # only bind loopback server-side)
-            _host_port = endpoint[len("tcp://"):]
-            _host, _, _port = _host_port.rpartition(":")
-            _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            _sock.connect((_host or "127.0.0.1", int(_port)))
-        else:
-            _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            _sock.connect(endpoint)
-        _sock.settimeout(300)
-    return _sock
+    # One connection per call is the correlation primitive.  It lets calls
+    # from ThreadPoolExecutor overlap without a shared recv race or a custom
+    # request-id multiplexer, and the connect overhead is negligible beside
+    # an actual tool/network call.
+    endpoint = os.environ["HERMES_RPC_SOCKET"]
+    if endpoint.startswith("tcp://"):
+        # tcp://host:port  (host is always 127.0.0.1 in practice — we
+        # only bind loopback server-side)
+        _host_port = endpoint[len("tcp://"):]
+        _host, _, _port = _host_port.rpartition(":")
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(300)
+        conn.connect((_host or "127.0.0.1", int(_port)))
+    else:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(300)
+        conn.connect(endpoint)
+    return conn
 
 def _call(tool_name, args):
     """Send a tool call to the parent process and return the parsed result."""
@@ -606,14 +604,15 @@ def _call(tool_name, args):
         "args": args,
         "token": os.environ.get("HERMES_RPC_TOKEN", ""),
     }) + "\\n"
-    # Session kernels outlive the RPC server's 300s idle window, so their
-    # connection can be legitimately gone by the next cell. The server
-    # re-accepts (HERMES_RPC_PERSISTENT=1); retry once on a fresh socket.
+    # One connection per call is the correlation primitive: read-only calls
+    # can overlap without a shared recv race or a request-id multiplexer.
+    # Session kernels can legitimately be between accepts after a long idle;
+    # retry one fresh connection in that persistent-kernel case.
     _attempts = 2 if os.environ.get("HERMES_RPC_PERSISTENT") == "1" else 1
-    with _call_lock:
-        for _attempt in range(_attempts):
+    for _attempt in range(_attempts):
+        try:
+            conn = _connect()
             try:
-                conn = _connect()
                 conn.sendall(request.encode())
                 buf = b""
                 while True:
@@ -623,17 +622,12 @@ def _call(tool_name, args):
                     buf += chunk
                     if buf.endswith(b"\\n"):
                         break
-                break
-            except (OSError, RuntimeError):
-                global _sock
-                try:
-                    if _sock is not None:
-                        _sock.close()
-                except OSError:
-                    pass
-                _sock = None
-                if _attempt + 1 >= _attempts:
-                    raise
+            finally:
+                conn.close()
+            break
+        except (OSError, RuntimeError):
+            if _attempt + 1 >= _attempts:
+                raise
     raw = buf.decode().strip()
     result = json.loads(raw)
     if isinstance(result, str):
@@ -719,6 +713,331 @@ def _call(tool_name, args):
 # Terminal parameters that must not be used from ephemeral sandbox scripts
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns"}
 
+# Read-only/network tools may overlap. Mutating or stateful tools use an
+# exclusive lane and gate against readers, so PTC concurrency cannot race a
+# shared terminal environment or observe a write/patch half-applied.
+_PARALLEL_RPC_TOOLS = frozenset({
+    "web_search",
+    "web_extract",
+    "read_file",
+    "search_files",
+})
+_RPC_FIRST_REQUEST_TIMEOUT = 2.0
+_MAX_RPC_REQUEST_BYTES = 1_000_000
+
+
+def _resolve_max_parallel_tool_calls(config: dict, max_tool_calls: int) -> int:
+    """Return the bounded per-execution RPC worker count."""
+    raw = config.get("max_parallel_tool_calls", DEFAULT_MAX_PARALLEL_TOOL_CALLS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_PARALLEL_TOOL_CALLS
+    return max(1, min(value, max(1, int(max_tool_calls)), MAX_PARALLEL_TOOL_CALLS))
+
+
+class _RpcDispatchState:
+    """Execution-local, lock-protected admission budget and metrics."""
+
+    def __init__(
+        self,
+        *,
+        tool_call_counter: list,
+        tool_call_log: list,
+        max_tool_calls: int,
+        max_parallel_tool_calls: int,
+        stop_event: threading.Event,
+    ) -> None:
+        self._counter = tool_call_counter
+        self._log = tool_call_log
+        self._max_tool_calls = max_tool_calls
+        self._stop_event = stop_event
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(max_parallel_tool_calls)
+        self._active_worker_tids: set[int] = set()
+
+    def acquire_slot(self) -> bool:
+        """Wait cooperatively for one execution-wide concurrency slot."""
+        while not self._stop_event.is_set():
+            if self._slots.acquire(timeout=0.1):
+                return True
+        return False
+
+    def release_slot(self) -> None:
+        self._slots.release()
+
+    def mark_worker_active(self) -> int:
+        tid = threading.current_thread().ident
+        with self._lock:
+            self._active_worker_tids.add(tid)
+        return tid
+
+    def mark_worker_done(self, tid: int) -> None:
+        with self._lock:
+            self._active_worker_tids.discard(tid)
+        try:
+            from tools.interrupt import set_interrupt
+
+            set_interrupt(False, tid)
+        except Exception:
+            pass
+
+    def interrupt_active_workers(self) -> None:
+        """Signal cooperative tool handlers when the outer script stops."""
+        with self._lock:
+            tids = list(self._active_worker_tids)
+        try:
+            from tools.interrupt import set_interrupt
+
+            for tid in tids:
+                set_interrupt(True, tid)
+        except Exception:
+            logger.debug("Could not interrupt sandbox RPC workers", exc_info=True)
+
+    def reserve(self) -> Optional[str]:
+        """Atomically admit one real dispatch, or return a tool error."""
+        with self._lock:
+            if self._stop_event.is_set():
+                return tool_error("Execution interrupted")
+            if self._counter[0] >= self._max_tool_calls:
+                return tool_error(
+                    f"Tool call limit reached ({self._max_tool_calls}). "
+                    "No more tool calls allowed in this execution."
+                )
+            # Reserve before dispatch.  Incrementing after completion lets a
+            # concurrent burst overshoot the budget before any worker returns.
+            self._counter[0] += 1
+        return None
+
+    def record(self, tool_name: str, duration: float) -> None:
+        # Arguments are intentionally not persisted here.  They can contain
+        # credentials in terminal commands/URLs and this log is not needed for
+        # result delivery or the live presentation bridge.
+        with self._lock:
+            self._log.append({
+                "tool": tool_name,
+                "duration": round(duration, 2),
+            })
+
+
+class _RpcReadWriteGate:
+    """Exclude stateful RPC calls from read-only calls without serializing reads.
+
+    Sandboxed code can issue RPCs concurrently.  A terminal command, patch, or
+    write_file call must have a coherent view of the same workspace as a
+    concurrent read_file call: neither may run while the other is active.
+    Read-only calls remain concurrent with each other.  Once a writer has
+    arrived, later readers wait behind it so a stream of reads cannot starve a
+    pending mutation (and, importantly, cannot observe its half-applied state).
+    """
+
+    def __init__(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+        self._condition = threading.Condition()
+        self._active_readers = 0
+        self._writer_active = False
+        self._waiting_writers = 0
+
+    def acquire(self, *, read_only: bool) -> bool:
+        """Acquire the shared-read or exclusive-write side cooperatively."""
+        with self._condition:
+            if read_only:
+                while (
+                    (self._writer_active or self._waiting_writers)
+                    and not self._stop_event.is_set()
+                ):
+                    self._condition.wait(timeout=0.05)
+                if self._stop_event.is_set():
+                    return False
+                self._active_readers += 1
+                return True
+
+            self._waiting_writers += 1
+            try:
+                while (
+                    (self._writer_active or self._active_readers)
+                    and not self._stop_event.is_set()
+                ):
+                    self._condition.wait(timeout=0.05)
+                if self._stop_event.is_set():
+                    return False
+                self._writer_active = True
+                return True
+            finally:
+                self._waiting_writers -= 1
+
+    def release(self, *, read_only: bool) -> None:
+        with self._condition:
+            if read_only:
+                self._active_readers -= 1
+            else:
+                self._writer_active = False
+            self._condition.notify_all()
+
+    def wake_all(self) -> None:
+        """Wake waiting workers promptly when their enclosing cell stops."""
+        with self._condition:
+            self._condition.notify_all()
+
+
+def _validate_rpc_request(
+    request: Any,
+    *,
+    rpc_token: str,
+    allowed_tools: frozenset,
+) -> Tuple[Optional[str], Any, Optional[str]]:
+    """Authenticate and normalize one sandbox RPC request."""
+    if not isinstance(request, dict):
+        return None, None, tool_error("Invalid RPC request: expected an object")
+    if not rpc_token or not secrets.compare_digest(
+        # Compare bytes: compare_digest rejects a non-ASCII str, while the
+        # request is untrusted sandbox JSON.
+        str(request.get("token") or "").encode(), rpc_token.encode()
+    ):
+        return None, None, tool_error("Unauthorized RPC request")
+
+    tool_name = request.get("tool", "")
+    tool_args = request.get("args", {})
+    if tool_name not in allowed_tools:
+        available = ", ".join(sorted(allowed_tools))
+        return None, None, tool_error(
+            f"Tool '{tool_name}' is not available in execute_code. "
+            f"Available: {available}"
+        )
+    if tool_name == "terminal" and isinstance(tool_args, dict):
+        tool_args = dict(tool_args)
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            tool_args.pop(param, None)
+    return tool_name, tool_args, None
+
+
+def _dispatch_rpc_request(
+    tool_name: str,
+    tool_args: Any,
+    *,
+    task_id: str,
+    state: _RpcDispatchState,
+    remote: bool = False,
+    dispatch=None,
+    read_write_gate: Optional[_RpcReadWriteGate] = None,
+) -> str:
+    """Run one admitted sandbox tool call on an RPC worker."""
+    read_only = tool_name in _PARALLEL_RPC_TOOLS
+    if read_write_gate is not None and not read_write_gate.acquire(
+        read_only=read_only
+    ):
+        return tool_error("Execution interrupted")
+    if not state.acquire_slot():
+        if read_write_gate is not None:
+            read_write_gate.release(read_only=read_only)
+        return tool_error("Execution interrupted")
+    worker_tid = state.mark_worker_active()
+    try:
+        admission_error = state.reserve()
+        if admission_error is not None:
+            return admission_error
+
+        from tools.nested_tool_presentation import current_nested_tool_presentation
+
+        call_start = time.monotonic()
+        # Persistent kernels re-enter the current cell's authority inside
+        # `dispatch`.  That authority owns the presentation ContextVar too,
+        # so it emits the lifecycle itself to avoid entering one Context from
+        # multiple workers. Per-call and remote transports already inherited
+        # the calling context and present here.
+        presentation = current_nested_tool_presentation() if dispatch is None else None
+        presentation_call_id = (
+            presentation.start(tool_name, tool_args)
+            if presentation is not None
+            else None
+        )
+        dispatch_failed = False
+        result = None
+        try:
+            with thread_scoped_silence():
+                if dispatch is None:
+                    from model_tools import handle_function_call
+
+                    result = handle_function_call(tool_name, tool_args, task_id=task_id)
+                else:
+                    result = dispatch(tool_name, tool_args)
+        except Exception as exc:
+            dispatch_failed = True
+            location = "remote sandbox" if remote else "sandbox"
+            logger.error("Tool call failed in %s: %s", location, exc, exc_info=True)
+            result = tool_error(str(exc))
+        finally:
+            if presentation is not None:
+                presentation.finish(
+                    presentation_call_id,
+                    result,
+                    force_error=dispatch_failed,
+                )
+            state.record(tool_name, time.monotonic() - call_start)
+        return result
+    finally:
+        state.mark_worker_done(worker_tid)
+        state.release_slot()
+        if read_write_gate is not None:
+            read_write_gate.release(read_only=read_only)
+
+
+def _recv_local_rpc_request(conn: socket.socket) -> Tuple[Optional[dict], Optional[str]]:
+    """Read exactly one bounded newline-delimited request from *conn*."""
+    conn.settimeout(_RPC_FIRST_REQUEST_TIMEOUT)
+    buf = b""
+    while b"\n" not in buf:
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            return None, tool_error("RPC request timed out")
+        if not chunk:
+            return None, tool_error("Invalid RPC request: connection closed")
+        buf += chunk
+        if len(buf) > _MAX_RPC_REQUEST_BYTES:
+            return None, tool_error("Invalid RPC request: payload too large")
+    line, _remainder = buf.split(b"\n", 1)
+    try:
+        request = json.loads(line.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return None, tool_error(f"Invalid RPC request: {exc}")
+    return request, None
+
+
+def _send_local_rpc_response(conn: socket.socket, result: str) -> None:
+    """Best-effort response send; connection close is the frame boundary."""
+    try:
+        conn.settimeout(300)
+        conn.sendall((result + "\n").encode())
+    except OSError:
+        logger.debug("Sandbox RPC client disconnected before response", exc_info=True)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _serve_local_rpc_connection(
+    conn: socket.socket,
+    tool_name: str,
+    tool_args: Any,
+    *,
+    task_id: str,
+    state: _RpcDispatchState,
+    dispatch=None,
+    read_write_gate: Optional[_RpcReadWriteGate] = None,
+) -> None:
+    result = _dispatch_rpc_request(
+        tool_name,
+        tool_args,
+        task_id=task_id,
+        state=state,
+        dispatch=dispatch,
+        read_write_gate=read_write_gate,
+    )
+    _send_local_rpc_response(conn, result)
+
 
 def _rpc_server_loop(
     server_sock: socket.socket,
@@ -729,133 +1048,121 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
     dispatch=None,
 ):
+    """Accept per-call connections and dispatch them on bounded workers.
+
+    ``dispatch`` is supplied only by a persistent session kernel. It rebinds
+    a request to the current cell's authority; this listener deliberately
+    never captures a cell context for its whole lifetime.
     """
-    Accept one client connection and dispatch tool-call requests until
-    the client disconnects or the call limit is reached.
+    from tools.daemon_pool import DaemonThreadPoolExecutor
 
-    ``dispatch`` overrides how an allowed, budgeted call is executed:
-    per-call sandboxes use the default (this thread already carries the
-    cell's context via propagate_context_to_thread), while session kernels
-    pass a dispatcher that rebinds each call to the CURRENT cell's
-    authority — the serving thread outlives many cells there and must not
-    freeze the first cell's context.
-    """
-    from model_tools import handle_function_call
+    parallel_workers = max(
+        1,
+        min(max_parallel_tool_calls, max_tool_calls, MAX_PARALLEL_TOOL_CALLS),
+    )
+    parallel_executor = DaemonThreadPoolExecutor(
+        max_workers=parallel_workers,
+        thread_name_prefix="hermes-rpc-read",
+    )
+    serial_executor = DaemonThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="hermes-rpc-write",
+    )
+    state = _RpcDispatchState(
+        tool_call_counter=tool_call_counter,
+        tool_call_log=tool_call_log,
+        max_tool_calls=max_tool_calls,
+        max_parallel_tool_calls=parallel_workers,
+        stop_event=stop_event,
+    )
+    read_write_gate = _RpcReadWriteGate(stop_event)
+    active_lock = threading.Lock()
+    active_connections: set[socket.socket] = set()
+    active_futures = set()
 
-    if dispatch is None:
-        def dispatch(tool_name, tool_args):
-            return handle_function_call(tool_name, tool_args, task_id=task_id)
-
-    conn = None
+    def _forget(future, conn):
+        with active_lock:
+            active_futures.discard(future)
+            active_connections.discard(conn)
     try:
         server_sock.settimeout(0.05)
         while not stop_event.is_set():
             try:
                 conn, _ = server_sock.accept()
-                break
             except socket.timeout:
                 continue
-        if conn is None:
-            return
-        conn.settimeout(300)
+            except OSError as exc:
+                if not stop_event.is_set():
+                    logger.debug("RPC listener socket error: %s", exc, exc_info=True)
+                break
 
-        buf = b""
-        while True:
+            with active_lock:
+                active_connections.add(conn)
+            request, read_error = _recv_local_rpc_request(conn)
+            if read_error is not None:
+                _send_local_rpc_response(conn, read_error)
+                with active_lock:
+                    active_connections.discard(conn)
+                continue
+
+            tool_name, tool_args, validation_error = _validate_rpc_request(
+                request,
+                rpc_token=rpc_token,
+                allowed_tools=allowed_tools,
+            )
+            if validation_error is not None:
+                _send_local_rpc_response(conn, validation_error)
+                with active_lock:
+                    active_connections.discard(conn)
+                continue
+
+            executor = (
+                parallel_executor
+                if tool_name in _PARALLEL_RPC_TOOLS
+                else serial_executor
+            )
             try:
-                chunk = conn.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buf += chunk
-
-            # Process all complete newline-delimited messages in the buffer
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-
-                call_start = time.monotonic()
-                try:
-                    request = json.loads(line.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    resp = tool_error(f"Invalid RPC request: {exc}")
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                if not rpc_token or not secrets.compare_digest(
-                    # Compare as bytes: compare_digest raises TypeError on a
-                    # str with non-ASCII characters, and the token comes from
-                    # sandbox-script-supplied JSON.
-                    str(request.get("token") or "").encode(), rpc_token.encode()
-                ):
-                    resp = tool_error("Unauthorized RPC request")
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                tool_name = request.get("tool", "")
-                tool_args = request.get("args", {})
-
-                # Enforce the allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    resp = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
-                    resp = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Strip forbidden terminal parameters
-                if tool_name == "terminal" and isinstance(tool_args, dict):
-                    for param in _TERMINAL_BLOCKED_PARAMS:
-                        tool_args.pop(param, None)
-
-                # Dispatch through the standard tool handler.
-                # Suppress stdout/stderr from internal tool handlers so
-                # their status prints don't leak into the CLI spinner.
-                try:
-                    with thread_scoped_silence():
-                        result = dispatch(tool_name, tool_args)
-                except Exception as exc:
-                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
-                    result = tool_error(str(exc))
-
-                tool_call_counter[0] += 1
-                call_duration = time.monotonic() - call_start
-
-                # Log for observability
-                args_preview = str(tool_args)[:80]
-                tool_call_log.append({
-                    "tool": tool_name,
-                    "args_preview": args_preview,
-                    "duration": round(call_duration, 2),
-                })
-
-                conn.sendall((result + "\n").encode())
-
-    except socket.timeout:
-        logger.debug("RPC listener socket timeout")
-    except OSError as e:
-        logger.debug("RPC listener socket error: %s", e, exc_info=True)
+                future = executor.submit(
+                    # Capture a fresh Context for every worker. Each worker
+                    # gets its own wrapper; a Context cannot be entered by
+                    # two threads at once. Persistent kernels rebind their
+                    # own CellAuthority inside `dispatch`.
+                    propagate_context_to_thread(_serve_local_rpc_connection),
+                    conn,
+                    tool_name,
+                    tool_args,
+                    task_id=task_id,
+                    state=state,
+                    dispatch=dispatch,
+                    read_write_gate=read_write_gate,
+                )
+            except RuntimeError as exc:
+                _send_local_rpc_response(conn, tool_error(str(exc)))
+                with active_lock:
+                    active_connections.discard(conn)
+                continue
+            with active_lock:
+                active_futures.add(future)
+            future.add_done_callback(lambda done, c=conn: _forget(done, c))
     finally:
-        if conn:
+        stop_event.set()
+        read_write_gate.wake_all()
+        state.interrupt_active_workers()
+        with active_lock:
+            connections = list(active_connections)
+            futures = list(active_futures)
+        for future in futures:
+            future.cancel()
+        for conn in connections:
             try:
                 conn.close()
-            except OSError as e:
-                logger.debug("RPC conn close error: %s", e)
+            except OSError:
+                pass
+        parallel_executor.shutdown(wait=False, cancel_futures=True)
+        serial_executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,136 +1318,245 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
 ):
-    """Poll the remote filesystem for tool call requests and dispatch them.
+    """Poll remote request files while dispatching tool work concurrently.
 
-    Runs in a background thread.  Each ``env.execute()`` spawns an
-    independent process, so these calls run safely concurrent with the
-    script-execution thread.
+    Only ``handle_function_call`` runs on the new worker pool.  RPC request /
+    response file operations remain serialized on this poller thread; the
+    foreground remote script already runs through the backend's established
+    concurrent command path.
     """
-    from model_tools import handle_function_call
+    from tools.daemon_pool import DaemonThreadPoolExecutor
 
+    parallel_workers = max(
+        1,
+        min(max_parallel_tool_calls, max_tool_calls, MAX_PARALLEL_TOOL_CALLS),
+    )
+    parallel_executor = DaemonThreadPoolExecutor(
+        max_workers=parallel_workers,
+        thread_name_prefix="hermes-remote-rpc-read",
+    )
+    serial_executor = DaemonThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="hermes-remote-rpc-write",
+    )
+    state = _RpcDispatchState(
+        tool_call_counter=tool_call_counter,
+        tool_call_log=tool_call_log,
+        max_tool_calls=max_tool_calls,
+        max_parallel_tool_calls=parallel_workers,
+        stop_event=stop_event,
+    )
+    read_write_gate = _RpcReadWriteGate(stop_event)
     poll_interval = 0.1  # 100 ms
-
     quoted_rpc_dir = shlex.quote(rpc_dir)
-    while not stop_event.is_set():
+    # future -> (request path, quoted request path, quoted response path)
+    pending: dict = {}
+    # request path -> (quoted request path, quoted response path, result,
+    #                  response already atomically committed)
+    ready: dict = {}
+    tracked_req_files: set[str] = set()
+    settled_req_files: set[str] = set()
+
+    def _queue_response(req_file, quoted_req_file, quoted_res_file, result):
+        ready[req_file] = (quoted_req_file, quoted_res_file, result, False)
+        tracked_req_files.add(req_file)
+
+    def _remote_command_failed(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        returncode = result.get("returncode")
+        if returncode is None:
+            return False
         try:
-            # List pending request files (skip .tmp partials)
-            ls_result = env.execute(
-                f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
-                cwd="/",
-                timeout=10,
+            return int(returncode) != 0
+        except (TypeError, ValueError):
+            return True
+
+    def _drain_completed() -> bool:
+        did_work = False
+        # Move completed dispatches onto the single-threaded response writer.
+        for future, metadata in list(pending.items()):
+            if not future.done():
+                continue
+            pending.pop(future, None)
+            req_file, quoted_req_file, quoted_res_file = metadata
+            try:
+                tool_result = future.result()
+            except Exception as exc:
+                logger.error(
+                    "Remote sandbox RPC worker failed: %s", exc, exc_info=True
+                )
+                tool_result = tool_error(str(exc))
+            _queue_response(
+                req_file,
+                quoted_req_file,
+                quoted_res_file,
+                tool_result,
             )
-            output = ls_result.get("output", "").strip()
-            if not output:
-                stop_event.wait(poll_interval)
+            did_work = True
+        return did_work
+
+    def _flush_ready() -> bool:
+        did_work = False
+        # A write failure keeps the result in `ready`, so the original tool is
+        # never dispatched twice merely because remote I/O failed transiently.
+        for req_file, response in list(ready.items()):
+            (
+                quoted_req_file,
+                quoted_res_file,
+                tool_result,
+                response_committed,
+            ) = response
+            try:
+                if not response_committed:
+                    encoded_result = base64.b64encode(
+                        tool_result.encode("utf-8")
+                    ).decode("ascii")
+                    write_result = env.execute(
+                        f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
+                        f" && mv {quoted_res_file}.tmp {quoted_res_file}",
+                        cwd="/",
+                        timeout=60,
+                    )
+                    if _remote_command_failed(write_result):
+                        raise RuntimeError("remote response write returned non-zero")
+                    response_committed = True
+                    ready[req_file] = (
+                        quoted_req_file,
+                        quoted_res_file,
+                        tool_result,
+                        True,
+                    )
+                remove_result = env.execute(
+                    f"rm -f {quoted_req_file}", cwd="/", timeout=5
+                )
+                if _remote_command_failed(remove_result):
+                    raise RuntimeError("remote request cleanup returned non-zero")
+            except Exception as exc:
+                if not stop_event.is_set():
+                    logger.debug(
+                        "Remote RPC response write failed for %s: %s",
+                        req_file,
+                        exc,
+                        exc_info=True,
+                    )
+                continue
+            ready.pop(req_file, None)
+            tracked_req_files.discard(req_file)
+            settled_req_files.add(req_file)
+            did_work = True
+        return did_work
+
+    def _discover_requests() -> bool:
+        did_work = False
+        ls_result = env.execute(
+            f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
+            cwd="/",
+            timeout=10,
+        )
+        output = ls_result.get("output", "").strip()
+        req_files = sorted([
+            value.strip()
+            for value in output.split("\n")
+            if value.strip()
+            and not value.strip().endswith(".tmp")
+            and "/req_" in value.strip()
+            and value.strip() not in tracked_req_files
+            and value.strip() not in settled_req_files
+        ])
+
+        for req_file in req_files:
+            if stop_event.is_set():
+                break
+            quoted_req_file = shlex.quote(req_file)
+            read_result = env.execute(
+                f"cat {quoted_req_file}", cwd="/", timeout=10
+            )
+            if _remote_command_failed(read_result):
+                raise RuntimeError(f"remote request read failed for {req_file}")
+            try:
+                request = json.loads(read_result.get("output", ""))
+                seq = int(request.get("seq", 0))
+                if seq <= 0:
+                    raise ValueError("sequence must be positive")
+                expected_req_file = f"{rpc_dir}/req_{seq:06d}"
+                if req_file != expected_req_file:
+                    raise ValueError("sequence does not match request filename")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.debug("Malformed RPC request in %s", req_file)
+                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
                 continue
 
-            req_files = sorted([
-                f.strip() for f in output.split("\n")
-                if f.strip()
-                and not f.strip().endswith(".tmp")
-                and "/req_" in f.strip()
-            ])
-
-            for req_file in req_files:
-                if stop_event.is_set():
-                    break
-
-                call_start = time.monotonic()
-
-                quoted_req_file = shlex.quote(req_file)
-                # Read request
-                read_result = env.execute(
-                    f"cat {quoted_req_file}",
-                    cwd="/",
-                    timeout=10,
+            seq_str = f"{seq:06d}"
+            quoted_res_file = shlex.quote(f"{rpc_dir}/res_{seq_str}")
+            tool_name, tool_args, validation_error = _validate_rpc_request(
+                request,
+                rpc_token=rpc_token,
+                allowed_tools=allowed_tools,
+            )
+            if validation_error is not None:
+                _queue_response(
+                    req_file,
+                    quoted_req_file,
+                    quoted_res_file,
+                    validation_error,
                 )
-                try:
-                    request = json.loads(read_result.get("output", ""))
-                except (json.JSONDecodeError, ValueError):
-                    logger.debug("Malformed RPC request in %s", req_file)
-                    # Remove bad request to avoid infinite retry
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-                    continue
+                did_work = True
+                continue
 
-                if not rpc_token or not secrets.compare_digest(
-                    # Compare as bytes: compare_digest raises TypeError on a
-                    # str with non-ASCII characters, and the token comes from
-                    # sandbox-script-supplied JSON.
-                    str(request.get("token") or "").encode(), rpc_token.encode()
-                ):
-                    logger.debug("Unauthorized RPC request in %s", req_file)
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-                    continue
-
-                tool_name = request.get("tool", "")
-                tool_args = request.get("args", {})
-                seq = request.get("seq", 0)
-                seq_str = f"{seq:06d}"
-                res_file = f"{rpc_dir}/res_{seq_str}"
-                quoted_res_file = shlex.quote(res_file)
-
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
-                else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
-                    try:
-                        with thread_scoped_silence():
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
-
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
-
-                # Write response atomically (tmp + rename).
-                # Use echo piping (not stdin_data) because Modal doesn't
-                # reliably deliver stdin to chained commands.
-                encoded_result = base64.b64encode(
-                    tool_result.encode("utf-8")
-                ).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/",
-                    timeout=60,
+            executor = (
+                parallel_executor
+                if tool_name in _PARALLEL_RPC_TOOLS
+                else serial_executor
+            )
+            try:
+                future = executor.submit(
+                    propagate_context_to_thread(_dispatch_rpc_request),
+                    tool_name,
+                    tool_args,
+                    task_id=task_id,
+                    state=state,
+                    remote=True,
+                    read_write_gate=read_write_gate,
                 )
+            except RuntimeError as exc:
+                _queue_response(
+                    req_file,
+                    quoted_req_file,
+                    quoted_res_file,
+                    tool_error(str(exc)),
+                )
+                continue
+            pending[future] = (
+                req_file,
+                quoted_req_file,
+                quoted_res_file,
+            )
+            tracked_req_files.add(req_file)
+            did_work = True
+        return did_work
 
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-
-        except Exception as e:
-            if not stop_event.is_set():
-                logger.debug("RPC poll error: %s", e, exc_info=True)
-
-        if not stop_event.is_set():
-            stop_event.wait(poll_interval)
+    try:
+        while not stop_event.is_set():
+            did_work = False
+            try:
+                did_work |= _drain_completed()
+                did_work |= _flush_ready()
+                did_work |= _discover_requests()
+            except Exception as exc:
+                if not stop_event.is_set():
+                    logger.debug("RPC poll error: %s", exc, exc_info=True)
+            if not did_work and not stop_event.is_set():
+                stop_event.wait(poll_interval)
+    finally:
+        read_write_gate.wake_all()
+        state.interrupt_active_workers()
+        for future in pending:
+            future.cancel()
+        parallel_executor.shutdown(wait=False, cancel_futures=True)
+        serial_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _format_interrupted_output(stdout_text: str) -> str:
@@ -1226,6 +1642,9 @@ def _execute_remote(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    max_parallel_tool_calls = _resolve_max_parallel_tool_calls(
+        _cfg, max_tool_calls
+    )
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
@@ -1281,6 +1700,7 @@ def _execute_remote(
                 sandbox_tools=frozenset(sandbox_tools),
                 timeout=timeout,
                 max_tool_calls=max_tool_calls,
+                max_parallel_tool_calls=max_parallel_tool_calls,
                 reset=bool(reset),
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
             )
@@ -1322,7 +1742,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, max_parallel_tool_calls,
             ),
             daemon=True,
         )
@@ -1623,6 +2043,9 @@ def execute_code(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    max_parallel_tool_calls = _resolve_max_parallel_tool_calls(
+        _cfg, max_tool_calls
+    )
 
     # Determine which tools the sandbox can call
     session_tools = set(enabled_tools) if enabled_tools else set()
@@ -1647,6 +2070,7 @@ def execute_code(
             sandbox_tools=frozenset(sandbox_tools),
             timeout=timeout,
             max_tool_calls=max_tool_calls,
+            max_parallel_tool_calls=max_parallel_tool_calls,
             reset=bool(reset),
             is_interrupted=_is_interrupted,
         )
@@ -1660,10 +2084,10 @@ def execute_code(
     # Windows: Python 3.9+ added partial AF_UNIX support but the file-backed
     # variant is flaky across Windows builds (requires Windows 10 1803+,
     # still fails under some configurations, and the socket file can't live
-    # on the same temp drive as the script).  Fall back to loopback TCP —
-    # same ephemeral port, same 1-connection listen queue, same serialized
-    # request/response framing.  The generated client reads the transport
-    # selector from HERMES_RPC_SOCKET (path vs. ``tcp://host:port``).
+    # on the same temp drive as the script).  Fall back to loopback TCP with
+    # the same per-call connection framing and bounded worker pool.  The
+    # generated client reads the transport selector from HERMES_RPC_SOCKET
+    # (path vs. ``tcp://host:port``).
     _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
     _use_tcp_rpc = _IS_WINDOWS
     if _use_tcp_rpc:
@@ -1717,7 +2141,10 @@ def execute_code(
             server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server_sock.bind(sock_path)
             os.chmod(sock_path, 0o600)
-        server_sock.listen(1)
+        # A per-call connection is its own response-correlation channel.  Keep
+        # enough backlog for one full parallel burst while worker concurrency
+        # remains bounded inside _rpc_server_loop.
+        server_sock.listen(max_parallel_tool_calls)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else gateway sandbox tool calls silently
@@ -1726,7 +2153,8 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, max_parallel_tool_calls,
             ),
             daemon=True,
         )
@@ -2395,7 +2823,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file "
-        "whose path rides in the result.\n\n"
+        "whose path rides in the result. Independent read-only or network "
+        "calls may run concurrently; stateful or mutating calls stay ordered. "
+        "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Built-in helpers (no import): json_parse(text) — tolerant "
         "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
