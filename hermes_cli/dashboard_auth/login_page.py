@@ -428,7 +428,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch('./auth/password-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

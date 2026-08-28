@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import ipaddress
 import inspect
 import importlib.util
-import ipaddress
 import json
 import logging
 import math
@@ -856,10 +856,23 @@ def _is_accepted_host(
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
-    # Loopback bind: accept the loopback names
+    # Loopback bind: accept every loopback literal/alias.  The auth-required
+    # remote-only deployment deliberately binds 127.0.0.2 (rather than the
+    # trusted 127.0.0.1), while an SSH local forward presents the dashboard to
+    # Desktop as 127.0.0.1.  Both are still kernel loopback; accepting one for
+    # the other does not admit an attacker-controlled DNS hostname.
     bound_lc = bound_host.lower()
-    if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+    try:
+        bound_is_loopback = ipaddress.ip_address(bound_lc).is_loopback
+    except ValueError:
+        bound_is_loopback = bound_lc == "localhost"
+    if bound_is_loopback:
+        if host_only == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host_only).is_loopback
+        except ValueError:
+            return False
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc

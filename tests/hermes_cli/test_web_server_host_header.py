@@ -47,6 +47,54 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_loopback_bind_accepts_only_configured_public_host(self):
+        """A tunnel may preserve its public Host while proxying to loopback.
+
+        Only the exact hostname explicitly declared in dashboard.public_url is
+        accepted; unrelated hosts remain blocked by the DNS-rebinding defence.
+        """
+        from hermes_cli.web_server import _is_accepted_host
+
+        public_host = "hermes.example.test"
+        assert _is_accepted_host(public_host, "127.0.0.2", public_host)
+        assert _is_accepted_host(
+            public_host + ":8443",
+            "127.0.0.2",
+            public_host,
+        )
+        assert not _is_accepted_host(
+            "evil.example",
+            "127.0.0.2",
+            public_host,
+        )
+        assert not _is_accepted_host(
+            public_host + ".evil.example",
+            "127.0.0.2",
+            public_host,
+        )
+
+    def test_noncanonical_loopback_bind_accepts_loopback_aliases(self):
+        """127.0.0.2 may be forwarded locally as 127.0.0.1 or localhost.
+
+        All of those names stay on the kernel loopback interface, while a DNS
+        hostname or non-loopback address must still fail the rebinding guard.
+        """
+        from hermes_cli.web_server import _is_accepted_host
+
+        for host in (
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "localhost",
+        ):
+            assert _is_accepted_host(host, "127.0.0.2")
+            assert _is_accepted_host(f"{host}:9119", "127.0.0.2")
+
+        assert _is_accepted_host("[::1]", "127.0.0.2")
+        assert _is_accepted_host("[::1]:9119", "127.0.0.2")
+
+        assert not _is_accepted_host("203.0.113.1", "127.0.0.2")
+        assert not _is_accepted_host("evil.example", "127.0.0.2")
 
     def test_trusted_public_host_is_exact_match_only(self):
         """A declared proxy host is accepted without weakening rebinding checks."""
