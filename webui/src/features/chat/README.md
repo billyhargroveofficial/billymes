@@ -64,6 +64,11 @@ invalidates stale asynchronous work, resets local state, and best-effort
 interrupts a busy previous session. Do not silently remove the interrupt path
 or make a failed interrupt strand the composer in a busy state.
 
+The sidebar catalog is durable, while a fresh `session.create` is not. Refresh
+the catalog after `prompt.submit` settles so the new row can be marked live.
+When compression rotates the durable id, the replayable `session.identity`
+edge rebinds the selected history id without replacing its stable live id.
+
 ## Verification focus
 
 Add or update focused tests whenever these invariants change. At minimum cover

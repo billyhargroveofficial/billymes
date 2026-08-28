@@ -476,6 +476,7 @@ def _(rid, params: dict) -> dict:
                         {
                             "session_id": live_sid,
                             "stored_session_id": str(live.get("session_key") or ""),
+                            "session_key": str(live.get("session_key") or ""),
                             "message_count": len(history),
                             "messages": [] if omit_messages else _history_to_messages(history),
                             "info": {
@@ -607,6 +608,10 @@ def _(rid, params: dict) -> dict:
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
+            # `session_key` predates the WebUI durable-history contract. Keep
+            # it for older clients, but every resume mode now also names the
+            # same current SQLite row explicitly.
+            payload["stored_session_id"] = str(payload.get("session_key") or "")
             if defer_history:
                 payload["messages"] = []
                 payload["message_count"] = int(
@@ -713,6 +718,7 @@ def _(rid, params: dict) -> dict:
                     "info": _lazy_resume_info(cwd, profile=profile),
                     "inflight": None,
                     "running": child_running,
+                    "stored_session_id": target,
                     "session_key": target,
                     "started_at": record["created_at"],
                     "status": "streaming" if child_running else "idle",
@@ -779,6 +785,7 @@ def _(rid, params: dict) -> dict:
                     ),
                     "inflight": None,
                     "running": False,
+                    "stored_session_id": target,
                     "session_key": target,
                     "started_at": record["created_at"],
                     "status": "resuming",
@@ -869,6 +876,7 @@ def _(rid, params: dict) -> dict:
                 ),
                 "inflight": None,
                 "running": False,
+                "stored_session_id": target,
                 "session_key": target,
                 "started_at": record["created_at"],
                 "status": "idle",
@@ -1071,6 +1079,7 @@ def _(rid, params: dict) -> dict:
         "info": _session_info(agent, session),
         "inflight": None,
         "running": False,
+        "stored_session_id": target,
         "session_key": target,
         "started_at": float(session.get("created_at") or time.time()),
         "status": "idle",

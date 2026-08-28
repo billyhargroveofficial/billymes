@@ -35,6 +35,7 @@ type Options = {
   historyUserTurnOffset: MutableRefObject<number>
   historyThroughDisplayKey: MutableRefObject<string | null>
   selectSessions: (live: string | null, history: string | null) => void
+  refreshSessionCatalog: () => void
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>
   setBusy: Dispatch<SetStateAction<boolean>>
   setRuntime: Dispatch<SetStateAction<SessionRuntime>>
@@ -72,6 +73,7 @@ export function useReconnectRecovery(options: Options) {
           return
         const durableId = resumed.stored_session_id ?? storedSessionId
         selectRecoveredSession(resumed.session_id, durableId)
+        if (durableId !== storedSessionId) state.refreshSessionCatalog()
         if (resumed.info)
           state.setRuntime((previous) =>
             mergeRuntime(previous, { type: 'session.info', payload: resumed.info }),

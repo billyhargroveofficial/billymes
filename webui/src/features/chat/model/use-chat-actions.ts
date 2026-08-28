@@ -9,6 +9,7 @@ import {
   isCurrentConfigOperation,
   isCurrentSessionOperation,
   submitMayHaveBeenAccepted,
+  submitThenRefreshSessionCatalog,
 } from './chat-race'
 import { userMessage } from './chat-messages'
 import type { SelectedSessions } from './event-scope'
@@ -107,7 +108,6 @@ export function useChatActions({
     if (generation !== refs.operationGeneration.current) return null
     selectSessions(parsed.session_id, parsed.stored_session_id)
     setRuntime((previous) => ({ ...previous, sessionStartedAt: Date.now() / 1000 }))
-    void queryClient.invalidateQueries({ queryKey: ['sessions', profile] }).catch(() => undefined)
     return parsed.session_id
   }
 
@@ -129,7 +129,10 @@ export function useChatActions({
       // Do this before prompt.submit: an uncertain submit is still one turn
       // and the following submit intentionally begins a new generation.
       markPresentationTurnSubmitted()
-      await request('prompt.submit', { session_id: sessionId, text })
+      await submitThenRefreshSessionCatalog(
+        () => request('prompt.submit', { session_id: sessionId, text }),
+        () => queryClient.invalidateQueries({ queryKey: ['sessions', profile] }),
+      )
       return true
     } catch (error) {
       if (generation !== refs.operationGeneration.current) return false

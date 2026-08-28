@@ -129,3 +129,10 @@ page whose marker says that retained boundary disappeared. A terminal event
 still clears active/busy state when its sequence is omitted at the replay base.
 Gateway orphan-reap grace is an operational guardrail only; correct resume
 ordering is what preserves the turn.
+
+The session picker follows explicit identity transitions. A fresh
+`session.create` has no durable database row, so the WebUI invalidates its
+catalog after `prompt.submit` settles. Compression rotates only the durable
+key; `session.identity` is a sequenced/replayable previous-to-current edge that
+the selected client applies atomically. Do not replace either rule with list
+polling, title matching, or a guessed root/tip mapping.

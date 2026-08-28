@@ -37,6 +37,26 @@ export function submitMayHaveBeenAccepted(error: unknown) {
   )
 }
 
+/**
+ * A fresh session becomes durable inside prompt.submit, not session.create.
+ * Start the sidebar refresh after that RPC settles, while keeping refresh
+ * failures best-effort and preserving the submit result/error verbatim.
+ */
+export async function submitThenRefreshSessionCatalog<T>(
+  submit: () => Promise<T>,
+  refresh: () => Promise<unknown>,
+) {
+  try {
+    return await submit()
+  } finally {
+    try {
+      void refresh().catch(() => undefined)
+    } catch {
+      // A catalog refresh must never rewrite prompt.submit delivery semantics.
+    }
+  }
+}
+
 export function isCurrentSessionOperation(
   token: SessionOperationToken,
   current: CurrentSessionOperation,

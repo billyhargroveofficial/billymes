@@ -200,6 +200,7 @@ run_regressions() {
             tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_session_messages_through_display_key_preserves_raw_dedupe_distinctions \
             tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_session_messages_unknown_display_key_falls_back_to_normal_page \
             tests/test_tui_gateway_server.py::test_session_activate_returns_inflight_stream_before_completion \
+            tests/test_tui_gateway_server.py::test_compression_identity_event_is_sequenced_and_replayable \
             -q
         scripts/run_tests.sh tests/agent/test_prompt_builder.py \
             -k 'skill_guidance_skips_quick_web_lookups or execution_guidance_does_not_refetch_injected_calendar_date or execution_guidance_calibrates_simple_lookup_depth' \

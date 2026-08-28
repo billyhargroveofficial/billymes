@@ -3150,6 +3150,8 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     assert resp["result"]["messages"] == expected
     assert resp["result"]["message_count"] == (1 if omit_messages else 2)
     assert resp["result"]["messages_omitted"] is omit_messages
+    assert resp["result"]["stored_session_id"] == target
+    assert resp["result"]["session_key"] == target
     expected_calls = [(target, False, True)] if omit_messages else [
         (target, False, False),
         (target, True, False),
@@ -3443,6 +3445,8 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
     )
 
     assert "error" not in resp, resp
+    assert resp["result"]["stored_session_id"] == "child1"
+    assert resp["result"]["session_key"] == "child1"
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "child substantive answer" in texts
     assert texts == ["child prompt", "child substantive answer", "child terse reply"]
@@ -5543,6 +5547,8 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
+        assert resp["result"]["stored_session_id"] == "stored-lazy"
+        assert resp["result"]["session_key"] == "stored-lazy"
         assert session["transport"] is live_transport
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
@@ -10436,6 +10442,57 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         assert events == ["sync", "notify"]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_compression_identity_event_is_sequenced_and_replayable(monkeypatch):
+    """A compression rotation publishes the durable-id handoff on the UI sid."""
+    from tui_gateway.event_replay import replay_snapshot, reset_replay_state
+
+    class _Transport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    approval = types.ModuleType("tools.approval")
+    approval.disable_session_yolo = lambda _key: None
+    approval.enable_session_yolo = lambda _key: None
+    approval.is_session_yolo_enabled = lambda _key: False
+    approval.register_gateway_notify = lambda _key, _callback: None
+    approval.unregister_gateway_notify = lambda _key: None
+    monkeypatch.setitem(sys.modules, "tools.approval", approval)
+    monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args, **_kwargs: None)
+
+    transport = _Transport()
+    session = _session(
+        agent=types.SimpleNamespace(session_id="tip-session"),
+        session_key="root-session",
+        transport=transport,
+    )
+    server._sessions["ui-session"] = session
+    reset_replay_state()
+    try:
+        server._sync_session_key_after_compress("ui-session", session)
+
+        assert session["session_key"] == "tip-session"
+        identity = transport.frames[-1]["params"]
+        assert identity == {
+            "type": "session.identity",
+            "session_id": "ui-session",
+            "seq": 1,
+            "payload": {
+                "stored_session_id": "tip-session",
+                "previous_stored_session_id": "root-session",
+                "reason": "compression",
+            },
+        }
+        assert replay_snapshot("ui-session", 0)["events"] == [identity]
+    finally:
+        server._sessions.pop("ui-session", None)
+        reset_replay_state()
 
 
 def test_session_compress_sync_failure_discards_lcm_notification(monkeypatch):

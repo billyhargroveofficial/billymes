@@ -9,7 +9,11 @@ import { emptyRuntime, mergeRuntime } from './chat-runtime'
 import { ChatRuntimeContext, type ChatRuntimeContextValue } from './chat-runtime-context'
 import { systemMessage } from './chat-messages'
 import { applyGatewayEvent } from './chat-reducer'
-import { eventBelongsToSelection, type SelectedSessions } from './event-scope'
+import {
+  eventBelongsToSelection,
+  sessionIdentityFromEvent,
+  type SelectedSessions,
+} from './event-scope'
 import {
   parseContextBreakdownResult,
   parseSessionPresentationListResult,
@@ -93,6 +97,9 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
     queryKey: modelKeys.info(profile),
     queryFn: () => modelSelectionApi.info(profile),
   })
+  const refreshSessionCatalog = () => {
+    void queryClient.invalidateQueries({ queryKey: ['sessions', profile] }).catch(() => undefined)
+  }
 
   const selectSessions = (live: string | null, history: string | null) => {
     const next = { live, history }
@@ -140,6 +147,15 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       return
     }
     if (!acceptGatewayEvent(eventWatermarks.current, event)) return
+
+    const reboundSelection = sessionIdentityFromEvent(event, selectedRef.current)
+    if (reboundSelection) {
+      if (reboundSelection.history !== selectedRef.current.history) {
+        selectSessions(reboundSelection.live, reboundSelection.history)
+        refreshSessionCatalog()
+      }
+      return
+    }
 
     if (event.type === 'session.info' || event.type === 'session.usage') {
       setRuntime((previous) => mergeRuntime(previous, event))
@@ -245,6 +261,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
     historyUserTurnOffset,
     historyThroughDisplayKey,
     selectSessions,
+    refreshSessionCatalog,
     setMessages,
     setBusy,
     setRuntime,
@@ -314,6 +331,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       restoreAttempted,
     },
     selectSessions,
+    refreshSessionCatalog,
     setMessages,
     setBusy,
     setRuntime,

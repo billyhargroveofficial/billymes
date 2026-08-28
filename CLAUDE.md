@@ -53,6 +53,12 @@ later `found=false` page is rejected rather than prepended.
 Even a terminal event at or below the replay base must settle busy/active
 runtime state. Reap grace is only a safety net, not a replacement for this
 ordering.
+Remember that `session.create` is intentionally non-persistent. Its first
+sidebar refresh belongs after `prompt.submit` settles, when the durable row is
+known to exist (or may exist after a lost ACK). During compression the live id
+does not rotate with the durable id: preserve and replay the exact
+`session.identity` previous-to-current edge, and let the selected WebUI session
+atomically rebind its history id before refreshing the catalog.
 Reconnect recovery is generation-owned; a stale attempt must not clear a newer
 attempt's buffer. Never content-dedupe assistant text/tools, never advance
 across `truncated`, and never allow an unbounded baseline-stabilization loop.

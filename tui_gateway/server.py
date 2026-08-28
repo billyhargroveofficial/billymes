@@ -7110,6 +7110,23 @@ def _sync_session_key_after_compress(
         # don't keep targeting the ended row.
         session["session_key"] = new_session_id
 
+    # The runtime session id deliberately survives compression: it owns the
+    # socket, event sequence and in-flight turn.  The durable session id does
+    # not — auto-compression forks a continuation row.  Tell reconnecting
+    # clients about that identity transition before the terminal turn frame so
+    # their REST/sidebar identity follows the same row as subsequent replay.
+    # `_emit` routes through `write_json`, which stamps every session event
+    # with a monotonic sequence and retains it for `session.events.since`.
+    _emit(
+        "session.identity",
+        sid,
+        {
+            "stored_session_id": new_session_id,
+            "previous_stored_session_id": old_key,
+            "reason": "compression",
+        },
+    )
+
     # #84417 (belt): invalidate any in-flight ``_drain_queued_prompt`` claim
     # that captured generation under the pre-rotation session_key. A raced
     # drain must not dispatch on the continuation with a stale claim; the

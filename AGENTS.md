@@ -284,6 +284,15 @@ busy/active state even when its sequence is at or below
 `replay_base_seq` and is correctly omitted from rendering. This prevents both
 the duplicate-tail and permanently-busy variants of F5 recovery.
 
+Session identity has a second explicit boundary. `session.create` is lazy and
+does not create its SQLite/sidebar row; the WebUI refreshes the catalog after
+`prompt.submit` settles, not immediately after create. Auto-compression keeps
+the live gateway id but rotates the durable `session_key`, so the gateway emits
+a sequenced/replayable `session.identity` edge with exact previous and new
+durable ids. The WebUI may apply that edge only to its selected live session
+and matching previous history id. This keeps the active sidebar row, REST
+history, presentation ledger, and reload resume on one compression tip.
+
 Never replace this protocol with text/content deduplication. Equal assistant
 text, reasoning, or tool previews are legitimate, and content heuristics lose
 turn boundaries. Focused recovery coverage lives in

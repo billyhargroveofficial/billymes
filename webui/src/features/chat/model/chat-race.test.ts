@@ -4,6 +4,7 @@ import {
   isCurrentConfigOperation,
   isCurrentSessionOperation,
   submitMayHaveBeenAccepted,
+  submitThenRefreshSessionCatalog,
 } from './chat-race'
 
 describe('chat race guards', () => {
@@ -61,5 +62,44 @@ describe('chat race guards', () => {
       false,
     )
     expect(submitMayHaveBeenAccepted({ delivery: 'unsent', method: 'prompt.submit' })).toBe(false)
+  })
+
+  it('refreshes the durable session catalog only after submit settles', async () => {
+    let settleSubmit: ((value: string) => void) | undefined
+    const order: string[] = []
+    const submitted = new Promise<string>((resolve) => {
+      settleSubmit = resolve
+    })
+    const pending = submitThenRefreshSessionCatalog(
+      () => {
+        order.push('submit')
+        return submitted
+      },
+      async () => {
+        order.push('refresh')
+      },
+    )
+
+    expect(order).toEqual(['submit'])
+    settleSubmit?.('accepted')
+    await expect(pending).resolves.toBe('accepted')
+    expect(order).toEqual(['submit', 'refresh'])
+  })
+
+  it('refreshes after a rejected submit without masking its delivery error', async () => {
+    const deliveryError = new Error('uncertain submit')
+    let refreshed = false
+    await expect(
+      submitThenRefreshSessionCatalog(
+        async () => {
+          throw deliveryError
+        },
+        async () => {
+          refreshed = true
+          throw new Error('catalog unavailable')
+        },
+      ),
+    ).rejects.toBe(deliveryError)
+    expect(refreshed).toBe(true)
   })
 })

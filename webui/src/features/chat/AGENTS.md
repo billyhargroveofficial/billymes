@@ -85,6 +85,16 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
   A terminal frame at or below
   `replay_base_seq` must still clear busy/active state. Orphan-reap grace is a
   guardrail, not an excuse to reverse this ordering.
+- A new gateway session is intentionally lazy: `session.create` returns live
+  and durable identities before the SQLite/sidebar row exists. Refresh the
+  session catalog only after `prompt.submit` settles (including an uncertain
+  ACK), because the submit path persists the row before its successful reply.
+  Refreshing only after create leaves the active turn absent from the sidebar.
+- Live and durable session identities are different. Compression can rotate
+  the durable key while the gateway `session_id` remains stable. A sequenced,
+  replayable `session.identity` event carries the exact previous/new durable
+  edge; apply it only for the selected live id and matching previous history
+  id, then refresh the sidebar. Never infer this rebind from titles or rows.
 - `stop()` sends `session.interrupt` for the active live session and clears the
   local busy state. `newChat()` invalidates stale generations and best-effort
   interrupts a busy previous session. Closed/error states must leave the UI

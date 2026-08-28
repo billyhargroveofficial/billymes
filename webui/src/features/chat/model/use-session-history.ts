@@ -59,6 +59,7 @@ type UseSessionHistoryOptions = {
   contextWindow: number
   refs: HistoryRefs
   selectSessions: (live: string | null, history: string | null) => void
+  refreshSessionCatalog: () => void
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>
   setBusy: Dispatch<SetStateAction<boolean>>
   setRuntime: Dispatch<SetStateAction<SessionRuntime>>
@@ -71,11 +72,7 @@ type UseSessionHistoryOptions = {
   makeSystemMessage: (message: string) => ChatMessage
 }
 
-/**
- * Opens durable sessions and owns paged transcript hydration. Live gateway
- * events are buffered by the caller while this hook reconciles REST history,
- * resume and replay into one ordered stream.
- */
+/** Owns paged hydration plus ordered REST, resume, replay, and live-event recovery. */
 export function useSessionHistory({
   profile,
   connectionState,
@@ -84,6 +81,7 @@ export function useSessionHistory({
   contextWindow,
   refs: optionsRefs,
   selectSessions,
+  refreshSessionCatalog,
   setMessages,
   setBusy,
   setRuntime,
@@ -134,6 +132,7 @@ export function useSessionHistory({
           id,
           isCurrent: () => generation === openGeneration.current,
           selectSessions,
+          onDurableIdentityChanged: refreshSessionCatalog,
           setBusy,
           setRuntime,
         })

@@ -89,4 +89,30 @@ describe('session open request ordering', () => {
     expect(busy).toBe(true)
     expect(runtime).toMatchObject({ model: 'gpt-test', turnStartedAt: 42 })
   })
+
+  it('refreshes the sidebar when resume advances to a compression tip', () => {
+    const refresh = vi.fn()
+    const select = vi.fn()
+    applyOpenSessionResume(
+      {
+        session_id: 'live-session',
+        stored_session_id: 'durable-tip',
+        info: null,
+        running: false,
+        turn_started_at: null,
+        inflight: null,
+      },
+      {
+        id: 'durable-root',
+        isCurrent: () => true,
+        selectSessions: select,
+        onDurableIdentityChanged: refresh,
+        setBusy: vi.fn(),
+        setRuntime: vi.fn(),
+      },
+    )
+
+    expect(select).toHaveBeenCalledWith('live-session', 'durable-tip')
+    expect(refresh).toHaveBeenCalledOnce()
+  })
 })

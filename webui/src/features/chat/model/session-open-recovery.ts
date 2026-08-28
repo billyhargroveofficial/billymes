@@ -27,18 +27,24 @@ export function applyOpenSessionResume(
     id,
     isCurrent,
     selectSessions,
+    onDurableIdentityChanged,
     setBusy,
     setRuntime,
   }: {
     id: string
     isCurrent: () => boolean
     selectSessions: (live: string | null, history: string | null) => void
+    onDurableIdentityChanged?: () => void
     setBusy: Dispatch<SetStateAction<boolean>>
     setRuntime: Dispatch<SetStateAction<SessionRuntime>>
   },
 ) {
   if (!isCurrent()) return
-  if (resumed.session_id) selectSessions(resumed.session_id, resumed.stored_session_id ?? id)
+  const durableId = resumed.stored_session_id ?? id
+  if (resumed.session_id) {
+    selectSessions(resumed.session_id, durableId)
+    if (durableId !== id) onDurableIdentityChanged?.()
+  }
   if (resumed.info) {
     setRuntime((previous) =>
       mergeRuntime(previous, { type: 'session.info', payload: resumed.info }),

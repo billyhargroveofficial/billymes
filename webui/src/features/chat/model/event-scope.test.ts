@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { eventBelongsToSelection } from './event-scope'
+import { eventBelongsToSelection, sessionIdentityFromEvent } from './event-scope'
 
 describe('eventBelongsToSelection', () => {
   const selected = { live: 'live-1', history: 'history-1' }
@@ -60,5 +60,78 @@ describe('eventBelongsToSelection', () => {
         history: 'history-1',
       }),
     ).toBe(true)
+  })
+})
+
+describe('sessionIdentityFromEvent', () => {
+  const selected = { live: 'live-1', history: 'durable-root' }
+
+  it('rebinds only the selected live session across the exact durable lineage edge', () => {
+    expect(
+      sessionIdentityFromEvent(
+        {
+          type: 'session.identity',
+          session_id: 'live-1',
+          payload: {
+            previous_stored_session_id: 'durable-root',
+            stored_session_id: 'durable-tip',
+            reason: 'compression',
+          },
+        },
+        selected,
+      ),
+    ).toEqual({ live: 'live-1', history: 'durable-tip' })
+  })
+
+  it('ignores foreign, malformed, and stale identity events', () => {
+    expect(
+      sessionIdentityFromEvent(
+        {
+          type: 'session.identity',
+          session_id: 'foreign-live',
+          payload: {
+            previous_stored_session_id: 'durable-root',
+            stored_session_id: 'durable-tip',
+          },
+        },
+        selected,
+      ),
+    ).toBeNull()
+    expect(
+      sessionIdentityFromEvent(
+        { type: 'session.identity', session_id: 'live-1', payload: { stored_session_id: '' } },
+        selected,
+      ),
+    ).toBeNull()
+    expect(
+      sessionIdentityFromEvent(
+        {
+          type: 'session.identity',
+          session_id: 'live-1',
+          payload: {
+            previous_stored_session_id: 'different-root',
+            stored_session_id: 'durable-tip',
+          },
+        },
+        selected,
+      ),
+    ).toBeNull()
+  })
+
+  it('treats replay of the already-applied identity as idempotent', () => {
+    const rebound = { live: 'live-1', history: 'durable-tip' }
+    expect(
+      sessionIdentityFromEvent(
+        {
+          type: 'session.identity',
+          session_id: 'live-1',
+          payload: {
+            previous_stored_session_id: 'durable-root',
+            stored_session_id: 'durable-tip',
+          },
+        },
+        rebound,
+      ),
+    ).toEqual(rebound)
   })
 })
