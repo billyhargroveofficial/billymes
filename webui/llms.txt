@@ -1,0 +1,51 @@
+# billymes-webui — agent index
+
+Read [`AGENTS.md`](AGENTS.md) first. It is the concise operating contract and
+routes to the detailed rules.
+
+## Start here
+
+- Runtime contract: Node.js 24.x and pnpm 11.x.
+- [`README.md`](README.md) — package integration and production-wrapper
+  overview.
+- [`docs/README.md`](docs/README.md) — documentation index and source-of-truth
+  policy.
+- [`docs/architecture.md`](docs/architecture.md) — current ownership and
+  dependency boundaries.
+- [`docs/development.md`](docs/development.md) — local workflow and verification
+  commands.
+- [`docs/reviews/2026-08-26-inherited-code-review.md`](docs/reviews/2026-08-26-inherited-code-review.md)
+  — full inherited-code review, remediations, and accepted boundaries.
+
+## Rules
+
+- [Rules index](.agents/rules/README.md)
+- [Documentation](.agents/rules/documentation.md)
+- [Testing](.agents/rules/testing.md)
+- [Frontend](.agents/rules/frontend.md)
+
+## Architecture sources
+
+- [`architecture.json`](architecture.json) is the machine-readable ownership
+  contract; its fail-closed checker is authoritative for structural drift.
+- `src/app/` composes the application.
+- `src/features/*/` owns feature behavior and exposes a narrow public entrypoint.
+- `src/shared/` owns reusable, feature-neutral code.
+- `server/gateway-proxy.ts` owns the gateway forwarding boundary.
+- [Chat capsule hazards](src/features/chat/AGENTS.md) cover profile/session
+  generations, persistent controller cleanup, reconnect, and interrupt.
+- [Gateway security boundary](src/features/gateway/AGENTS.md) covers loopback-only
+  serving, origin-bound token storage, and proxy header hygiene.
+
+## Decisions and long goals
+
+- [`docs/adr/README.md`](docs/adr/README.md) indexes accepted durable decisions.
+- [`docs/adr/0001-feature-capsules.md`](docs/adr/0001-feature-capsules.md)
+  records the feature-capsule boundary.
+- [`docs/adr/0003-lazy-heavy-render-runtimes.md`](docs/adr/0003-lazy-heavy-render-runtimes.md)
+  records the split JavaScript budget and the lazy math/animation runtimes.
+- [`loop-develop/README.md`](loop-develop/README.md) is used only for an
+  explicitly requested long-lived goal or handoff.
+
+Do not treat this index or prose as permission to invent unimplemented runtime
+behavior. Verify details in source, `architecture.json`, and the checker.

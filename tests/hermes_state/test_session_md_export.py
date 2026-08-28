@@ -93,3 +93,21 @@ def test_fork_children_created_before_continuation_do_not_hijack_lineage(tmp_pat
     finally:
         db.close()
 
+
+def test_compression_lineage_matches_resume_tip_when_a_stale_sibling_exists(tmp_path):
+    """Ledger replay must not follow an older orphan instead of the live tip."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session("stale", source="cli", parent_session_id="root")
+        db.append_message("stale", role="user", content="stale sibling")
+        db.end_session("stale", "ws_orphan_reap")
+        db.create_session("live", source="cli", parent_session_id="root")
+        db.append_message("live", role="user", content="actual continuation")
+
+        assert db.get_compression_tip("root") == "live"
+        assert db.get_compression_lineage("root") == ["root", "live"]
+        assert db.get_compression_lineage("live") == ["root", "live"]
+    finally:
+        db.close()

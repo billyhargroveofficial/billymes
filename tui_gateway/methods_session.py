@@ -3670,6 +3670,86 @@ def _(rid, params: dict) -> dict:
     })
 
 
+@method("session.presentation.list")
+def _(rid, params: dict) -> dict:
+    """Read durable, display-only hosted/nested tool cards for one session.
+
+    ``session_id`` may be the gateway's ephemeral live id or the stored
+    conversation key used by REST history.  The sidecar remains deliberately
+    separate from model transcript rows, so this RPC is the only reload path
+    for presentation-only cards.
+    """
+    requested = str(params.get("session_id") or "").strip()
+    if not requested:
+        return _err(rid, 4006, "session_id required")
+    from tui_gateway.presentation_ledger import MAX_LIST_LIMIT
+
+    try:
+        limit = int(params.get("limit", MAX_LIST_LIMIT))
+    except (TypeError, ValueError):
+        return _err(rid, -32602, "invalid params: limit must be an integer")
+    # The sidecar retains a little more than one UI page so a reconnect can
+    # ask for a safe bounded slice, without letting a client turn this RPC
+    # into an unbounded history dump.
+    if not 1 <= limit <= MAX_LIST_LIMIT:
+        return _err(
+            rid,
+            -32602,
+            f"invalid params: limit must be between 1 and {MAX_LIST_LIMIT}",
+        )
+
+    live = _sessions.get(requested)
+    profile = (params.get("profile") or "").strip() or None
+    lineage: list[str] = []
+    if live is not None:
+        session_key = str(live.get("session_key") or "").strip()
+        home = live.get("profile_home") or _hermes_home
+    else:
+        session_key = requested
+        home = _profile_home(profile) or _hermes_home
+        # Resolve a compression ancestor/title-compatible stored id to the
+        # same durable key a cold ``session.resume`` uses.  This only reads
+        # state.db; ledger data itself never flows into it.
+        with _profile_db(params) as db:
+            if db is not None:
+                try:
+                    resolved = db.resolve_session_id(requested) or requested
+                    session_key = db.resolve_resume_session_id(resolved) or resolved
+                except Exception:
+                    pass
+    if not session_key:
+        return _err(rid, 4006, "session_id required")
+    # The selected session may be the tip of a compression chain.  Cards
+    # recorded before the rotation remain under their original segment id, so
+    # load exactly that root-to-tip compression lineage.  Do not traverse
+    # generic parent links: branch/delegate/tool children are separate
+    # conversations and must never appear in this display projection.
+    with _profile_db(params) as db:
+        if db is not None:
+            try:
+                lineage = db.get_compression_lineage(session_key)
+            except Exception:
+                logger.debug("presentation lineage read failed", exc_info=True)
+    lineage = list(dict.fromkeys(str(item or "").strip() for item in lineage))
+    lineage = [item for item in lineage if item] or [session_key]
+    try:
+        from tui_gateway.presentation_ledger import PresentationLedger
+
+        cards, total = PresentationLedger(home).list_many(lineage, limit=limit)
+    except Exception:
+        logger.debug("presentation ledger read failed", exc_info=True)
+        cards, total = [], 0
+    return _ok(
+        rid,
+        {
+            "session_id": session_key,
+            "cards": cards,
+            "total": total,
+            "truncated": total > len(cards),
+        },
+    )
+
+
 @method("session.events.stats")
 def _(rid, params: dict) -> dict:
     """Replay-buffer telemetry (ops/debug)."""

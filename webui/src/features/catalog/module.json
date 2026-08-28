@@ -1,0 +1,5 @@
+{
+  "id": "catalog",
+  "description": "Profile-scoped skills, toolsets, and MCP catalog screens.",
+  "dependencies": ["profiles"]
+}

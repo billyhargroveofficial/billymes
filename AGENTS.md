@@ -57,6 +57,7 @@ hermes-gateway.service                  default messaging/Telegram gateway
 hermes-gateway-*.service                additional enabled profile gateways
 hermes-serve.service                    official Dashboard backend
 hermes-dashboard-tailscale.service      Tailscale-only Dashboard proxy
+billymes-ui.service                     loopback WebUI static/proxy server
 telegram-mcp.service                    shared Telegram account MCP service
 ```
 
@@ -66,6 +67,28 @@ the repository path. For diagnosis, prefer `systemctl --user show`,
 `journalctl --user -u <unit>`, and the configured `/api/health` endpoints.
 Restarting a gateway should drain in-flight turns; do not kill it merely to
 make a source edit take effect.
+
+### WebUI integration boundary
+
+`webui/` is source owned by this fork, not a standalone repository or copied
+deployment. Its production unit template lives at
+`webui/systemd/billymes-ui.service`: source and built assets run from
+`$HOME/.hermes/hermes-agent/webui`, while the only runtime environment file is
+external (`$HOME/billymes-ui/env`, mode `0600`). Do not commit its values,
+personal paths, service drop-ins, or a second WebUI history.
+
+Use `pnpm install --frozen-lockfile`, `pnpm test`, and `pnpm build` in
+`webui/`. Its development server is loopback-only and may not open SSH tunnels
+or mint credentials. The built-in production server intentionally has no
+`/__mes/gateway` mutation endpoint; `404` there is valid local same-origin
+operation. `scripts/billymes-update` owns WebUI dependency sync/build,
+installation of the tracked user-service unit, restart of
+`billymes-ui.service`, and its configured health endpoint.
+
+WebUI is presentation-only for hosted Responses tools. Preserve the durable
+presentation ledger and its replay order/fan-out: a provider batch can display
+several hosted cards but must not become synthetic regular tool messages,
+duplicate after reconnect, or execute during replay.
 
 ### Owned behavior map
 
@@ -84,7 +107,9 @@ automation:
 7. authenticated loopback/Tailscale Dashboard behavior, subscription usage,
    and session turn counts;
 8. hardened Telegram documents and rich-message delivery; and
-9. the guarded Billymes updater and focused GitHub regression workflow.
+9. the guarded Billymes updater and focused GitHub regression workflow; and
+10. the in-tree WebUI production wrapper and hosted-tool presentation/replay
+    boundary.
 
 When upstream lands equivalent behavior, remove the corresponding owned commit
 during a reviewed rebase. Do not keep both implementations, and do not squash
@@ -123,33 +148,48 @@ The main code surfaces are `agent/codex_runtime.py`,
 `tests/agent/test_codex_responses_hosted_tool_projection.py`, with transport,
 display, emoji, and TUI duration/context coverage alongside it.
 
-### Known defect: hosted cards disappear after page reload
+### Durable hosted-card replay
 
-Live hosted cards currently arrive through observer/WebSocket lifecycle events,
-but those presentation events are not part of the persisted display
-projection. After a browser reload or cold session resume, the Dashboard
-reconstructs the conversation from stored messages; because hosted tools are
-correctly absent from the model transcript, their cards disappear. Execution
-still happened provider-side. This is a persistence/replay defect, not a reason
-to convert hosted calls into local Hermes tools.
+Hosted cards arrive through observer/WebSocket lifecycle events and remain
+correctly absent from the model transcript. Billymes persists their redacted
+display projection in the per-profile `presentation.db` sidecar and reloads it
+through `session.presentation.list`. The WebUI merges those cards by stable
+turn/card identity after REST history hydration and gateway resume/replay, so a
+cold page reload preserves the original commentary -> tools -> final order.
 
-The correct fix is a durable, presentation-only event ledger/sidecar keyed by
-session, turn, provider item/call ID, and projected batch member. It must:
+Compression is part of that identity boundary. Ledger reads and sidebar counts
+aggregate only the selected conversation's compression root-to-tip lineage;
+branch, delegate, reset, and tool children must never be included. The paged
+messages endpoint uses the same logical display lineage when
+`include_compacted=true` and returns `pagination.user_turn_offset`, the number
+of visible user turns strictly before the returned chronological page. The UI
+uses that one-based/global offset to attach durable cards after a cold reload
+or after loading an older 500-row page. Keep the history projection, offset,
+and ledger lineage in lockstep.
+
+The presentation ledger and its clients must:
 
 1. persist redacted start/complete state, canonical name, safe arguments,
    status/error, ordering, and explicit duration idempotently;
-2. replay the same cards through the normal Dashboard session-resume/display
-   path after reload and process restart;
+2. replay the same cards through the normal WebUI session-resume/display path
+   after reload and process restart, without duplicating cards already seen
+   live;
 3. never feed those rows to the model, never create a Hermes tool result, and
    never invoke the local executor;
 4. preserve stable fan-out (one four-query provider item reloads as the same
    four cards), including cancellation and terminal-only streams; and
-5. have an end-to-end regression: live events -> persisted session -> cold
-   reload -> identical cards/non-zero durations, while the model transcript
+5. preserve separate normalized transcript tool counts and presentation/display
+   counts in the session API; and
+6. keep end-to-end regression coverage for live events -> persisted session ->
+   cold reload -> identical cards/non-zero durations, while the model transcript
    and normalized function-call count remain free of synthetic hosted rows.
 
-Do not solve the reload symptom by persisting fake function/tool messages.
-That would regress the speed and semantics this fork exists to preserve.
+The main persistence surfaces are `tui_gateway/presentation_ledger.py`,
+`tui_gateway/server.py`, `tui_gateway/methods_session.py`, and
+`webui/src/features/chat/model/presentation-tools.ts`; the paged lineage
+contract also lives in `hermes_state.py` and both session HTTP adapters. Do not
+replace this design with fake function/tool transcript messages; that would
+regress the speed and semantics this fork exists to preserve.
 
 **Never give up on the right solution.**
 

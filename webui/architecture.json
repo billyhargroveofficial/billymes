@@ -1,0 +1,22 @@
+{
+  "sourceRoot": "src",
+  "allowedRoots": ["app", "features", "shared"],
+  "legacyRoots": ["lib", "components", "pages", "App.tsx"],
+  "featureRoot": "features",
+  "featureManifest": "module.json",
+  "publicEntry": "index.ts",
+  "alias": "@/",
+  "sourceExtensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+  "sizeExtensions": [".ts", ".tsx"],
+  "serverRoot": "server",
+  "serverSizeExtensions": [".ts", ".tsx"],
+  "maxProductionFileLines": 450,
+  "sizeExcludedPatterns": [
+    "(^|/)(__tests__|tests?)(/|$)",
+    "(^|/)generated(/|$)",
+    "(^|/)generated\\.[cm]?[jt]sx?$",
+    "\\.(test|spec|stories|generated)\\.[cm]?[jt]sx?$",
+    "\\.d\\.ts$"
+  ],
+  "excludedDirectories": ["node_modules", "dist"]
+}

@@ -4162,7 +4162,9 @@ class APIServerAdapter(BasePlatformAdapter):
         return min(parsed, maximum)
 
     @staticmethod
-    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    def _session_response(
+        session: Dict[str, Any], *, presentation_tool_call_count: int = 0
+    ) -> Dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at",
@@ -4181,7 +4183,57 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        # Hosted Responses and nested sandbox calls deliberately never become
+        # normalized ``tool_calls`` transcript rows. Keep that source count
+        # honest and offer the sidebar an explicit display aggregate instead.
+        presentation_count = max(0, int(presentation_tool_call_count or 0))
+        tool_count = max(0, int(session.get("tool_call_count") or 0))
+        payload["presentation_tool_call_count"] = presentation_count
+        payload["display_tool_call_count"] = tool_count + presentation_count
         return payload
+
+    @staticmethod
+    def _presentation_counts_for_sessions(
+        db: Any, sessions: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """Read one profile-local sidecar once for an API list page."""
+        ids = [str(session.get("id") or "").strip() for session in sessions]
+        if not any(ids):
+            return {}
+        try:
+            from tui_gateway.presentation_ledger import PresentationLedger
+
+            db_path = getattr(db, "db_path", None)
+            if not db_path:
+                return {}
+            lineages: Dict[str, List[str]] = {}
+            for session_id in ids:
+                if not session_id:
+                    continue
+                try:
+                    lineage = db.get_compression_lineage(session_id)
+                except Exception:
+                    lineage = [session_id]
+                clean = list(
+                    dict.fromkeys(str(item or "").strip() for item in lineage)
+                )
+                lineages[session_id] = [item for item in clean if item] or [session_id]
+            # Compression expands one visible row into several historical
+            # sidecar ids, but this remains one sidecar query per page rather
+            # than an N+1 count loop.
+            all_ids = list(
+                dict.fromkeys(
+                    member for lineage in lineages.values() for member in lineage
+                )
+            )
+            raw_counts = PresentationLedger(Path(db_path).parent).count_many(all_ids)
+            return {
+                session_id: sum(raw_counts.get(member, 0) for member in lineage)
+                for session_id, lineage in lineages.items()
+            }
+        except Exception:
+            logger.debug("presentation ledger count failed", exc_info=True)
+            return {}
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -4290,12 +4342,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         sessions = [s for s in sessions if (s.get("title") or "").strip() == title_filter]
                 except Exception:
                     pass  # resolution degrades to today's no-row behavior
+        presentation_counts = await asyncio.to_thread(
+            self._presentation_counts_for_sessions, db, sessions
+        )
         # Back-filled pins arrive PAST the limit, so counting them would report
         # another page that doesn't exist. Only the recency window decides.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list",
-            "data": [self._session_response(s) for s in sessions],
+            "data": [
+                self._session_response(
+                    s, presentation_tool_call_count=presentation_counts.get(str(s.get("id") or ""), 0)
+                )
+                for s in sessions
+            ],
             "limit": limit,
             "offset": offset,
             "has_more": windowed >= limit,
@@ -4430,7 +4490,14 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        db = await self._ensure_session_db_async()
+        counts = await asyncio.to_thread(self._presentation_counts_for_sessions, db, [session]) if db else {}
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(
+                session, presentation_tool_call_count=counts.get(str(session.get("id") or ""), 0)
+            ),
+        })
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
@@ -4506,6 +4573,9 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_limit = request.query.get("limit")
         raw_offset = request.query.get("offset", "0")
         order = request.query.get("order")
+        include_compacted = _coerce_request_bool(
+            request.query.get("include_compacted"), default=False
+        )
         if order not in (None, "oldest", "latest"):
             return web.json_response(
                 _openai_error(
@@ -4538,6 +4608,17 @@ class APIServerAdapter(BasePlatformAdapter):
             limit=limit,
             offset=offset,
             latest=latest_page,
+            include_compacted=include_compacted,
+            include_ancestors=include_compacted,
+        )
+        user_turn_offset = await asyncio.to_thread(
+            db.get_user_turn_offset,
+            resolved_id,
+            limit=limit,
+            offset=offset,
+            latest=latest_page,
+            include_compacted=include_compacted,
+            include_ancestors=include_compacted,
         )
         return web.json_response({
             "object": "list",
@@ -4548,6 +4629,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
                 "returned": len(messages),
+                "user_turn_offset": user_turn_offset,
             },
         })
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Billymes WebUI static server and Hermes gateway proxy
+After=network.target
+
+[Service]
+WorkingDirectory=%h/.hermes/hermes-agent/webui
+EnvironmentFile=%h/billymes-ui/env
+ExecStart=/usr/bin/node %h/.hermes/hermes-agent/webui/server/serve.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

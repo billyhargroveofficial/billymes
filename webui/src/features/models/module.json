@@ -1,0 +1,5 @@
+{
+  "id": "models",
+  "description": "Profile-aware model catalog route.",
+  "dependencies": ["model-selection", "profiles"]
+}

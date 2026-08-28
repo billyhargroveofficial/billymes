@@ -1,0 +1,5 @@
+{
+  "id": "memory",
+  "description": "Profile-scoped stored memory: learning-graph chunks and learned skills with node editing, plus memory backend selection, provider setup, and reset.",
+  "dependencies": ["profiles"]
+}

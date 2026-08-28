@@ -1,0 +1,5 @@
+{
+  "id": "profile-management",
+  "description": "Lazy profile management route, model assignment, and capability-scoped model settings.",
+  "dependencies": ["model-selection", "profiles"]
+}

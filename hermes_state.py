@@ -10286,6 +10286,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
+    def _next_compression_child(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the preferred *real* compression child for one parent.
+
+        Both resume and display-ledger replay must pick the same chain when a
+        crash/reconnect left multiple children behind.  Keep the established
+        preference order (continuing compression, then live, then stale), but
+        apply the parent-bound fork predicate in Python: a continuation can
+        inherit a delegate/branch marker that names an older ancestor and is
+        still a valid child of this parent.
+        """
+        parent = self.get_session(session_id)
+        if not parent or parent.get("end_reason") != "compression":
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM sessions AS child
+                WHERE child.parent_session_id = ?
+                ORDER BY
+                  CASE
+                    WHEN child.end_reason = 'compression' THEN 0
+                    WHEN child.ended_at IS NULL THEN 1
+                    ELSE 2
+                  END,
+                  {_sql_session_last_active("child")} DESC,
+                  child.started_at DESC,
+                  child.id DESC
+                """,
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            candidate = dict(row)
+            if self._is_compression_child_row(candidate):
+                return candidate
+        return None
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
@@ -10312,34 +10349,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
-                    f"""
-                    SELECT child.id
-                    FROM sessions parent
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
-                    ORDER BY
-                      CASE
-                        WHEN child.end_reason = 'compression' THEN 0
-                        WHEN child.ended_at IS NULL THEN 1
-                        ELSE 2
-                      END,
-                      {_sql_session_last_active("child")} DESC,
-                      child.started_at DESC,
-                      child.id DESC
-                    LIMIT 1
-                    """,
-                    (current,),
-                )
-                row = cursor.fetchone()
-            if row is None:
+            child = self._next_compression_child(current)
+            if child is None:
                 return current
-            child_id = row["id"]
+            child_id = child["id"]
             if not child_id or child_id in seen:
                 return current
             seen.add(child_id)
@@ -11947,6 +11960,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def _display_session_ids(
+        self, session_id: str, *, include_ancestors: bool = False
+    ) -> List[str]:
+        """Return a branch-safe compression lineage for display reads only."""
+        if not include_ancestors:
+            return [session_id]
+        try:
+            lineage = self.get_compression_lineage(session_id)
+        except Exception:
+            lineage = []
+        ids = list(dict.fromkeys(str(item or "").strip() for item in lineage))
+        return [item for item in ids if item] or [session_id]
+
     def get_messages(
         self,
         session_id: str,
@@ -11956,6 +11982,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        include_ancestors: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -11971,6 +11998,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         unreachable once the UI exhausts its active-only window. Soft-deleted
         Undo/Rewind rows (``active=0, compacted=0``) stay excluded; use
         ``include_inactive`` for those.
+
+        ``include_ancestors=True`` joins only the root-to-tip compression
+        lineage. It deliberately excludes ordinary parent/child relations
+        such as branches, delegates, and tool sessions. This is the paginated
+        display-history counterpart to :meth:`get_resume_conversations`.
 
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
@@ -11992,6 +12024,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        session_ids = self._display_session_ids(
+            session_id, include_ancestors=include_ancestors
+        )
+        placeholders = ",".join("?" for _ in session_ids)
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -12004,10 +12040,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
+            f"SELECT * FROM messages WHERE session_id IN ({placeholders})"
             f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
         )
-        params: list = [session_id]
+        params: list = [*session_ids]
         if after_id is not None:
             params.append(after_id)
         if include_compacted:
@@ -12021,9 +12057,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # then apply paging.
             with self._read_ctx() as conn:
                 cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                    f"SELECT * FROM messages WHERE session_id IN ({placeholders})" + active_clause
                     + " ORDER BY id ASC",
-                    [session_id],
+                    session_ids,
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
@@ -12095,6 +12131,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
+
+    def get_user_turn_offset(
+        self,
+        session_id: str,
+        *,
+        include_inactive: bool = False,
+        include_compacted: bool = False,
+        include_ancestors: bool = False,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        latest: bool = False,
+    ) -> int:
+        """Count visible user turns before the page returned by ``get_messages``.
+
+        This is additive pagination metadata for display clients that attach
+        presentation-only cards by one-based user-turn index.  It mirrors the
+        exact active/compacted filtering and latest-page semantics of
+        :meth:`get_messages`; it never writes transcript state.  The ordinary
+        active-only path stays in SQLite, while compacted display history uses
+        ``get_messages``' existing deduplication before counting so cloned
+        compaction rows cannot inflate the offset.
+        """
+        safe_offset = max(0, int(offset))
+        safe_limit = None if limit is None else max(0, int(limit))
+
+        if include_compacted:
+            # get_messages already performs the required active-preferred,
+            # newest-generation dedupe for compacted display rows.  It must be
+            # the source of truth here as well, otherwise the turn index would
+            # drift exactly when history is rehydrated across compaction.
+            messages = self.get_messages(
+                session_id,
+                include_inactive=include_inactive,
+                include_compacted=True,
+                include_ancestors=include_ancestors,
+            )
+            total = len(messages)
+            if latest:
+                end = max(0, total - safe_offset)
+                start = 0 if safe_limit is None else max(0, end - safe_limit)
+            else:
+                start = min(safe_offset, total)
+            return sum(1 for message in messages[:start] if message.get("role") == "user")
+
+        if include_inactive:
+            active_clause = ""
+        else:
+            active_clause = " AND active = 1"
+        session_ids = self._display_session_ids(
+            session_id, include_ancestors=include_ancestors
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+
+        with self._read_ctx() as conn:
+            if latest:
+                total_row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM messages "
+                    f"WHERE session_id IN ({placeholders})"
+                    f"{active_clause}",
+                    session_ids,
+                ).fetchone()
+                total = int(total_row["count"] if total_row else 0)
+                end = max(0, total - safe_offset)
+                start = 0 if safe_limit is None else max(0, end - safe_limit)
+            else:
+                start = safe_offset
+            if start <= 0:
+                return 0
+            # Keep this one bounded SQL aggregation rather than hydrating a
+            # whole transcript merely to count the preceding user rows.
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM ("
+                f"SELECT role FROM messages WHERE session_id IN ({placeholders})"
+                f"{active_clause} ORDER BY id ASC LIMIT ?"
+                ") WHERE role = 'user'",
+                [*session_ids, start],
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results in these sessions that mention a GitHub PR url.
@@ -13401,21 +13515,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         seen = {root["id"]}
         current = root
         while current.get("end_reason") == "compression":
-            with self._lock:
-                rows = self._conn.execute(
-                    """
-                    SELECT * FROM sessions
-                    WHERE parent_session_id = ?
-                    ORDER BY started_at ASC
-                    """,
-                    (current["id"],),
-                ).fetchall()
-            next_child = None
-            for row in rows:
-                candidate = dict(row)
-                if self._is_compression_child_row(candidate):
-                    next_child = candidate
-                    break
+            next_child = self._next_compression_child(current["id"])
             if not next_child or next_child["id"] in seen:
                 break
             lineage.append(next_child["id"])

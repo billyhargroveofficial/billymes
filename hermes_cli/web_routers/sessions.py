@@ -16,6 +16,7 @@ import asyncio  # noqa: F401 — used by handlers
 import json
 import logging
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
@@ -49,6 +50,79 @@ _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
+
+
+def _compression_lineage_for_session(db, session_id: object) -> list[str]:
+    """Return only the compression root-to-tip ids for one display row.
+
+    ``list_sessions_rich`` projects a compression root onto its live tip.  A
+    presentation card recorded before that rotation remains keyed by the old
+    segment, so this is deliberately not a generic parent/child traversal:
+    branches, delegates, and tool children must never leak into the visible
+    conversation's hosted-card stream.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+    try:
+        lineage = db.get_compression_lineage(sid)
+    except Exception:
+        return [sid]
+    clean = list(dict.fromkeys(str(item or "").strip() for item in lineage))
+    return [item for item in clean if item] or [sid]
+
+
+def _presentation_counts_for_sessions(db, session_ids: list[object]) -> dict[str, int]:
+    """Read the profile-local hosted/nested-tool sidecar once per list page.
+
+    The sidecar is intentionally not part of ``state.db``: these cards are a
+    display projection for provider-hosted and sandbox calls, never normalized
+    transcript tool rows. Its location follows the SessionDB opened for this
+    request, keeping same-id sessions in separate profiles isolated.
+    """
+    ids = [str(session_id or "").strip() for session_id in session_ids]
+    ids = [session_id for session_id in ids if session_id]
+    if not ids:
+        return {}
+    try:
+        from tui_gateway.presentation_ledger import PresentationLedger
+
+        db_path = getattr(db, "db_path", None)
+        if not db_path:
+            return {}
+        lineages = {
+            session_id: _compression_lineage_for_session(db, session_id)
+            for session_id in ids
+        }
+        # One sidecar aggregate for the whole page: expanding compression
+        # lineages must not turn the sidebar into one SQLite query per row.
+        all_ids = list(
+            dict.fromkeys(
+                member for lineage in lineages.values() for member in lineage
+            )
+        )
+        raw_counts = PresentationLedger(Path(db_path).parent).count_many(all_ids)
+        return {
+            session_id: sum(raw_counts.get(member, 0) for member in lineage)
+            for session_id, lineage in lineages.items()
+        }
+    except Exception:
+        _log.debug("presentation ledger count failed", exc_info=True)
+        return {}
+
+
+def _add_presentation_counts(session: dict, presentation_count: object) -> None:
+    """Additive display count; leave transcript ``tool_call_count`` truthful."""
+    try:
+        count = max(0, int(presentation_count or 0))
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        transcript_count = max(0, int(session.get("tool_call_count") or 0))
+    except (TypeError, ValueError):
+        transcript_count = 0
+    session["presentation_tool_call_count"] = count
+    session["display_tool_call_count"] = transcript_count + count
 
 
 @list_router.get("/api/sessions")
@@ -160,6 +234,13 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+            presentation_counts = _presentation_counts_for_sessions(
+                db, [s.get("id") for s in sessions]
+            )
+            for s in sessions:
+                _add_presentation_counts(
+                    s, presentation_counts.get(str(s.get("id") or ""), 0)
+                )
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
@@ -581,6 +662,8 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             _cron_profile_home(profile)[0] if profile else _cron_default_profile()
         )
         session["is_default_profile"] = session["profile"] == "default"
+        presentation_count = _presentation_counts_for_sessions(db, [sid]).get(sid, 0)
+        _add_presentation_counts(session, presentation_count)
         return session
     finally:
         db.close()
@@ -639,20 +722,34 @@ async def get_session_messages(
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
             _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
+            messages = db.get_messages(
                 sid,
                 limit=_limit,
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
+                # The SPA's durable display hydration must match
+                # session.resume: compacted history spans only the selected
+                # conversation's compression root→tip, never branch/tool
+                # children.
+                include_ancestors=include_compacted,
             )
+            user_turn_offset = db.get_user_turn_offset(
+                sid,
+                limit=_limit,
+                offset=offset,
+                latest=latest_page,
+                include_compacted=include_compacted,
+                include_ancestors=include_compacted,
+            )
+            return sid, _limit, messages, user_turn_offset
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages = result
+    sid, _limit, messages, user_turn_offset = result
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
 
@@ -681,6 +778,7 @@ async def get_session_messages(
             "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(projected_messages),
+            "user_turn_offset": user_turn_offset,
         },
     }
 

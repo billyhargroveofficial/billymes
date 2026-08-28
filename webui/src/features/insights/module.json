@@ -1,0 +1,5 @@
+{
+  "id": "insights",
+  "description": "Profile-scoped usage analytics route: a single cost figure, one calls pulse, compact model/tool/skill rankings, and a short sessions/tasks/host footer, drawn with a local inline-SVG chart kit.",
+  "dependencies": ["profiles"]
+}

@@ -2421,19 +2421,27 @@ def _media_serve_roots() -> list[Path]:
     key or a screenshot outside the cache) merely because the suffix passes the
     allowlist.
     """
-    home = get_hermes_home()
+    try:
+        home = get_hermes_home().resolve()
+    except (OSError, RuntimeError):
+        return []
     roots = [home / "images", home / "screenshots", home / "cache"]
     out: list[Path] = []
     for root in roots:
         try:
-            out.append(root.resolve())
+            resolved = root.resolve()
         except (OSError, RuntimeError):
             continue
+        # A profile-owned media root may contain symlinks which resolve back
+        # into its own tree, but the root directory itself must not become an
+        # alias for another profile (or an arbitrary external directory).
+        if resolved == home or home in resolved.parents:
+            out.append(resolved)
     return out
 
 
 @app.get("/api/media")
-async def get_media(path: str):
+async def get_media(path: str, profile: Optional[str] = None):
     """Return a gateway-local image file as a base64 data URL.
 
     Lets remote clients (the desktop app over the network, or the web dashboard
@@ -2452,7 +2460,12 @@ async def get_media(path: str):
     if target.suffix.lower() not in _MEDIA_CONTENT_TYPES:
         raise HTTPException(status_code=415, detail="Unsupported media type")
 
-    roots = _media_serve_roots()
+    # ``path`` belongs to the selected profile's local filesystem namespace.
+    # Resolve the roots in the same lightweight, validated scope used by the
+    # audio endpoints; otherwise a named profile's images are rejected against
+    # the dashboard process profile's ``HERMES_HOME``.
+    with _config_profile_scope(profile):
+        roots = _media_serve_roots()
     if not any(target == root or root in target.parents for root in roots):
         raise HTTPException(status_code=403, detail="Path outside media roots")
 
@@ -2559,7 +2572,21 @@ def _dashboard_local_update_managed_externally() -> bool:
     return True
 
 
-def _managed_files_policy(request: Request, *, create_root: bool = True) -> ManagedFilesPolicy:
+def _managed_files_policy(
+    request: Request,
+    *,
+    create_root: bool = True,
+    profile: Optional[str] = None,
+) -> ManagedFilesPolicy:
+    requested = (profile or "").strip()
+    if requested and requested.lower() != "current":
+        # Attachments are data owned by the profile that will receive their
+        # prompt marker.  Do not derive this from the process's HERMES_HOME or
+        # trust a client path: the normal profile resolver validates the name
+        # and returns the canonical target directory.
+        root = _canonical_path(_resolve_profile_dir(requested))
+        return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
+
     raw_forced_root = os.environ.get(_MANAGED_FILES_ROOT_ENV, "").strip()
     if raw_forced_root:
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
@@ -2583,8 +2610,9 @@ def _resolve_managed_path(
     request: Request,
     *,
     for_write: bool = False,
+    profile: Optional[str] = None,
 ) -> tuple[ManagedFilesPolicy, Path, str]:
-    policy = _managed_files_policy(request)
+    policy = _managed_files_policy(request, profile=profile)
     text = _path_text(raw_path)
     root = policy.locked_root
 
@@ -2665,6 +2693,57 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
     if len(data) > _MANAGED_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File is too large")
     return data, mime_type
+
+
+def _publish_managed_upload(tmp_path: Path, target: Path, *, overwrite: bool) -> None:
+    """Publish a completed upload without a check-then-write overwrite race.
+
+    ``os.replace`` is appropriate for explicit overwrites.  For the default
+    ``overwrite=False`` path, a pre-flight ``target.exists()`` check alone is
+    insufficient: two attachment requests can both pass it and the later one
+    would silently clobber the first.  A hard-link claim is atomic within the
+    target directory, and both source and destination are deliberately
+    siblings on the same filesystem.
+    """
+    if target.is_dir():
+        raise HTTPException(status_code=409, detail="A directory already exists at that path")
+    if overwrite:
+        os.replace(tmp_path, target)
+        return
+    try:
+        os.link(tmp_path, target)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="File already exists")
+
+
+def _write_managed_upload_bytes(target: Path, data: bytes, *, overwrite: bool) -> None:
+    """Stage a JSON upload beside its target, then publish it atomically."""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="File is not writable")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create parent directory: {exc}")
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".upload", dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "wb") as out:
+            out.write(data)
+        _publish_managed_upload(tmp_path, target, overwrite=overwrite)
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="File is not writable")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+    finally:
+        # ``os.replace`` consumes the staging name.  The no-overwrite hard
+        # link leaves it behind, so always remove the staging inode after a
+        # successful claim and on every error path.
+        tmp_path.unlink(missing_ok=True)
 
 
 _CHAT_IMAGE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
@@ -2759,8 +2838,10 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
 
 
 @app.get("/api/files")
-async def list_managed_files(request: Request, path: Optional[str] = None):
-    policy, target, display_path = _resolve_managed_path(path, request)
+async def list_managed_files(
+    request: Request, path: Optional[str] = None, profile: Optional[str] = None
+):
+    policy, target, display_path = _resolve_managed_path(path, request, profile=profile)
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
     if not target.is_dir():
@@ -2792,8 +2873,8 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
 
 @app.get("/api/files/read")
-async def read_managed_file(request: Request, path: str):
-    policy, target, display_path = _resolve_managed_path(path, request)
+async def read_managed_file(request: Request, path: str, profile: Optional[str] = None):
+    policy, target, display_path = _resolve_managed_path(path, request, profile=profile)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -2832,9 +2913,12 @@ def _managed_file_response(
     *,
     content_disposition_type: str,
     media_only: bool = False,
+    profile: Optional[str] = None,
 ) -> FileResponse:
     """Build a range-aware response after applying managed-file policy."""
-    policy, target, _display_path = _resolve_managed_path(path, request)
+    policy, target, _display_path = _resolve_managed_path(
+        path, request, profile=profile
+    )
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -2863,7 +2947,9 @@ def _managed_file_response(
 
 
 @app.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
+async def download_managed_file(
+    request: Request, path: str, profile: Optional[str] = None
+):
     """Stream a managed file as an attachment download.
 
     Remote clients (desktop app, browser dashboard) open agent-written files
@@ -2884,12 +2970,15 @@ async def download_managed_file(request: Request, path: str):
         path,
         content_disposition_type="inline" if is_media_subresource else "attachment",
         media_only=is_media_subresource,
+        profile=profile,
     )
 
 
 @app.get("/api/files/stream")
 @app.head("/api/files/stream")
-async def stream_managed_file(request: Request, path: str):
+async def stream_managed_file(
+    request: Request, path: str, profile: Optional[str] = None
+):
     """Stream managed audio/video inline with HTTP Range support.
 
     Electron's Chromium media pipeline may reject an attachment response used
@@ -2903,25 +2992,19 @@ async def stream_managed_file(request: Request, path: str):
         path,
         content_disposition_type="inline",
         media_only=True,
+        profile=profile,
     )
 
 
 @app.post("/api/files/upload")
-async def upload_managed_file(payload: ManagedFileUpload, request: Request):
-    policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
-    if target.exists() and target.is_dir():
-        raise HTTPException(status_code=409, detail="A directory already exists at that path")
-    if target.exists() and not payload.overwrite:
-        raise HTTPException(status_code=409, detail="File already exists")
-
+async def upload_managed_file(
+    payload: ManagedFileUpload, request: Request, profile: Optional[str] = None
+):
+    policy, target, display_path = _resolve_managed_path(
+        payload.path, request, for_write=True, profile=profile
+    )
     data, _mime_type = _decode_data_url(payload.data_url)
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="File is not writable")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+    _write_managed_upload_bytes(target, data, overwrite=payload.overwrite)
 
     return {
         "ok": True,
@@ -2947,13 +3030,11 @@ async def upload_managed_file_stream(
     file: UploadFile = File(...),
     path: str = Form(...),
     overwrite: bool = Form(True),
+    profile: Optional[str] = None,
 ):
-    policy, target, display_path = _resolve_managed_path(path, request, for_write=True)
-    if target.exists() and target.is_dir():
-        raise HTTPException(status_code=409, detail="A directory already exists at that path")
-    if target.exists() and not overwrite:
-        raise HTTPException(status_code=409, detail="File already exists")
-
+    policy, target, display_path = _resolve_managed_path(
+        path, request, for_write=True, profile=profile
+    )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
     except PermissionError:
@@ -2968,7 +3049,6 @@ async def upload_managed_file_stream(
     )
     tmp_path = Path(tmp_name)
     total = 0
-    renamed = False
     try:
         with os.fdopen(tmp_fd, "wb") as out:
             while True:
@@ -2979,8 +3059,7 @@ async def upload_managed_file_stream(
                 if total > _MANAGED_FILE_MAX_BYTES:
                     raise HTTPException(status_code=413, detail="File is too large")
                 out.write(chunk)
-        os.replace(tmp_path, target)
-        renamed = True
+        _publish_managed_upload(tmp_path, target, overwrite=overwrite)
     except HTTPException:
         raise
     except PermissionError:
@@ -2992,9 +3071,9 @@ async def upload_managed_file_stream(
         # BaseException paths the `except` clauses above don't catch — most
         # importantly asyncio.CancelledError when a browser aborts a large
         # upload mid-stream (the exact NS-501 scenario). os.replace clears
-        # tmp_path on success, so only unlink when the rename didn't happen.
-        if not renamed:
-            tmp_path.unlink(missing_ok=True)
+        # tmp_path on explicit-overwrite success. The no-overwrite hard-link
+        # claim leaves the staging inode, so clean it in both paths.
+        tmp_path.unlink(missing_ok=True)
         await file.close()
 
     return {
@@ -3006,8 +3085,12 @@ async def upload_managed_file_stream(
 
 
 @app.post("/api/files/mkdir")
-async def create_managed_directory(payload: ManagedDirectoryCreate, request: Request):
-    policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
+async def create_managed_directory(
+    payload: ManagedDirectoryCreate, request: Request, profile: Optional[str] = None
+):
+    policy, target, display_path = _resolve_managed_path(
+        payload.path, request, for_write=True, profile=profile
+    )
     if target.exists() and not target.is_dir():
         raise HTTPException(status_code=409, detail="A file already exists at that path")
 
@@ -3027,8 +3110,12 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
 
 
 @app.delete("/api/files")
-async def delete_managed_file(payload: ManagedFileDelete, request: Request):
-    policy, target, display_path = _resolve_managed_path(payload.path, request)
+async def delete_managed_file(
+    payload: ManagedFileDelete, request: Request, profile: Optional[str] = None
+):
+    policy, target, display_path = _resolve_managed_path(
+        payload.path, request, profile=profile
+    )
     if policy.locked_root is not None and target == policy.locked_root:
         raise HTTPException(status_code=400, detail="Cannot delete the managed files root")
     if target.parent == target:

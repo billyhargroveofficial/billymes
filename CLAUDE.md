@@ -10,7 +10,20 @@ overlay** taking precedence over generic upstream workflow text.
 In particular, do not mistake this for a disposable upstream checkout: it is
 the live `billy/production` source tree. Read `OWNED_PATCHES.md`, preserve the
 `origin/main` mirror policy, release through `billymes-update`, and preserve the
-provider-hosted semantics described in the hosted-tool contract. The known
-reload defect is a missing presentation-event persistence/replay layer; fake
-function calls or synthetic tool-result transcript rows are explicitly not an
-acceptable fix.
+provider-hosted semantics described in the hosted-tool contract. Reload replay
+uses the per-profile `presentation.db` sidecar plus
+`session.presentation.list`; fake function calls or synthetic tool-result
+transcript rows are explicitly not an acceptable replacement.
+
+For WebUI work, treat `webui/` as an in-tree package, not a separate checkout.
+Read `webui/AGENTS.md`; production source stays in this fork and only the
+`%h/billymes-ui/env` runtime file is external/private. Keep the production
+`/__mes/gateway` 404 and the hosted-tool presentation-ledger replay invariant.
+The WebUI also owns durable session selection, event-sequence replay, bounded
+history pagination, profile-scoped attachments, and key-gated production
+proxying; preserve those contracts when changing chat or transport code.
+For paged history, `include_compacted=true` is a compression-only logical
+root-to-tip display read and `pagination.user_turn_offset` is the count of
+visible user turns before that chronological page. It must be computed from the
+same deduplicated projection the endpoint returns; otherwise hosted cards bind
+to the wrong turn after a reload or an older-page fetch.

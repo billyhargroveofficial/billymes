@@ -1,0 +1,6 @@
+{
+  "entryJsMaxBytes": 410000,
+  "coldStartJsMaxBytes": 620000,
+  "chunkJsMaxBytes": 500000,
+  "totalJsMaxBytes": 1400000
+}

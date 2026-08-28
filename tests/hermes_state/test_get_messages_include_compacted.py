@@ -111,6 +111,66 @@ class TestIncludeCompacted:
         all_ids = _row_ids(db, sid, include_compacted=True)
         assert [m["id"] for m in page] == all_ids[2:5]
 
+    def test_user_turn_offset_uses_the_same_deduped_compacted_projection(self, db):
+        """A latest tail starts after the user turns hidden by its page cap."""
+        sid = "s1"
+        db = _seed(db, sid)
+        all_messages = db.get_messages(sid, include_compacted=True)
+        page = db.get_messages(
+            sid, include_compacted=True, latest=True, limit=2, offset=0
+        )
+
+        assert [message["id"] for message in page] == [
+            message["id"] for message in all_messages[-2:]
+        ]
+        assert db.get_user_turn_offset(
+            sid, include_compacted=True, latest=True, limit=2, offset=0
+        ) == sum(message["role"] == "user" for message in all_messages[:-2])
+
+    def test_paged_display_history_includes_only_compression_ancestors(self, db):
+        """A rotated REST session mirrors resume's root-to-tip display history."""
+        db.create_session("root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [
+                {"role": "user", "content": "root q"},
+                {"role": "assistant", "content": "root a"},
+            ],
+        )
+        db.end_session("root", "compression")
+        db.create_session("tip", source="cli", parent_session_id="root")
+        db.append_messages_batch(
+            "tip",
+            [
+                {"role": "user", "content": "tip q"},
+                {"role": "assistant", "content": "tip a"},
+            ],
+        )
+        db.create_session(
+            "branch",
+            source="cli",
+            parent_session_id="root",
+            model_config={"_branched_from": "root"},
+        )
+        db.append_message("branch", role="user", content="branch must stay hidden")
+
+        page = db.get_messages(
+            "tip",
+            include_compacted=True,
+            include_ancestors=True,
+            latest=True,
+            limit=2,
+        )
+
+        assert [message["content"] for message in page] == ["tip q", "tip a"]
+        assert db.get_user_turn_offset(
+            "tip",
+            include_compacted=True,
+            include_ancestors=True,
+            latest=True,
+            limit=2,
+        ) == 1
+
 
 class TestDisplayDedupe:
     """Compaction epochs copy the protected tail into each new generation, so

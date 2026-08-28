@@ -1,0 +1,5 @@
+{
+  "id": "providers",
+  "description": "OAuth logins, API keys, credential pool, and custom endpoints for the gateway's model providers.",
+  "dependencies": ["profiles"]
+}

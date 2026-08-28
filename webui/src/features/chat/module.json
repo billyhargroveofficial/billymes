@@ -1,0 +1,5 @@
+{
+  "id": "chat",
+  "description": "Persistent chat runtime, session history, streaming events, and chat UI.",
+  "dependencies": ["gateway", "model-selection", "profiles"]
+}

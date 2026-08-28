@@ -1,0 +1,5 @@
+{
+  "id": "profiles",
+  "description": "Always-mounted active profile scope, metadata, storage, and API access.",
+  "dependencies": ["model-selection"]
+}

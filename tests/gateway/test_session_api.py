@@ -11,6 +11,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
+from tui_gateway.presentation_ledger import PresentationLedger
 
 
 @pytest.fixture
@@ -107,6 +108,7 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "offset": 0,
         "order": "latest",
         "returned": 500,
+        "user_turn_offset": 1,
     }
     assert payload["data"][0]["content"] == "msg 1"
     assert payload["data"][-1]["content"] == "msg 500"
@@ -114,6 +116,176 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "msg 1",
         "msg 2",
     ]
+    assert explicit["pagination"]["user_turn_offset"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_message_user_turn_offset_tracks_visible_page_boundaries(
+    adapter, session_db
+):
+    session_id = session_db.create_session("turn-offset", "api_server")
+    session_db.replace_messages(
+        session_id,
+        [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+        ],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        oldest = await (
+            await cli.get(f"/api/sessions/{session_id}/messages?limit=2&offset=2")
+        ).json()
+        latest = await (
+            await cli.get(
+                f"/api/sessions/{session_id}/messages?limit=2&offset=1&order=latest"
+            )
+        ).json()
+
+    assert [row["content"] for row in oldest["data"]] == ["u2", "a2"]
+    assert oldest["pagination"]["user_turn_offset"] == 1
+    assert [row["content"] for row in latest["data"]] == ["a2", "u3"]
+    assert latest["pagination"]["user_turn_offset"] == 2
+
+
+@pytest.mark.asyncio
+async def test_session_messages_include_compression_ancestors_for_display_hydration(
+    adapter, session_db
+):
+    root = session_db.create_session("root before compression", "api_server")
+    session_db.append_message(root, "user", "root u")
+    session_db.append_message(root, "assistant", "root a")
+    session_db.end_session(root, "compression")
+    tip = session_db.create_session(
+        "tip after compression", "api_server", parent_session_id=root
+    )
+    session_db.append_message(tip, "user", "tip u")
+    session_db.append_message(tip, "assistant", "tip a")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        payload = await (
+            await cli.get(
+                f"/api/sessions/{tip}/messages?include_compacted=true&limit=2&order=latest"
+            )
+        ).json()
+
+    assert [row["content"] for row in payload["data"]] == ["tip u", "tip a"]
+    assert payload["pagination"]["user_turn_offset"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_messages_honors_include_compacted(
+    adapter, session_db, monkeypatch
+):
+    session_id = session_db.create_session("compacted-messages", "api_server")
+    session_db.replace_messages(
+        session_id,
+        [{"role": "user", "content": "visible"}],
+    )
+    observed = []
+    original_get_messages = session_db.get_messages
+
+    def record_get_messages(*args, **kwargs):
+        observed.append(kwargs.get("include_compacted"))
+        return original_get_messages(*args, **kwargs)
+
+    monkeypatch.setattr(session_db, "get_messages", record_get_messages)
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        ordinary = await (await cli.get(
+            f"/api/sessions/{session_id}/messages?order=oldest"
+        )).json()
+        complete = await (await cli.get(
+            f"/api/sessions/{session_id}/messages?order=oldest&include_compacted=true"
+        )).json()
+
+    assert [row["content"] for row in ordinary["data"]] == ["visible"]
+    assert [row["content"] for row in complete["data"]] == ["visible"]
+    # The compacted offset uses the same deduped display projection as the
+    # returned page, so it performs one additional compacted read.
+    assert observed == [False, True, True]
+    assert complete["pagination"]["user_turn_offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_sidebar_counts_presentation_cards_without_mutating_tool_count(
+    adapter, session_db, monkeypatch
+):
+    first = session_db.create_session("hosted-sidebar", "api_server")
+    second = session_db.create_session("nested-sidebar", "api_server")
+    ledger = PresentationLedger(session_db.db_path.parent)
+    ledger.start(first, "hosted_sidebar", "web_search", {"query": "hosted"})
+    ledger.start(second, "sandbox_sidebar", "web_extract", {"urls": ["https://example.test"]})
+
+    calls = []
+    original_count_many = PresentationLedger.count_many
+
+    def counted_count_many(self, session_ids):
+        calls.append(tuple(session_ids))
+        return original_count_many(self, session_ids)
+
+    monkeypatch.setattr(PresentationLedger, "count_many", counted_count_many)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        listed = await (await cli.get("/api/sessions?limit=20")).json()
+        detail = await (await cli.get(f"/api/sessions/{first}")).json()
+
+    # List-page hydration uses one sidecar aggregation, never an N+1 query.
+    assert len(calls) == 2  # one list page plus one explicit detail request
+    assert set(calls[0]) == {first, second}
+    by_id = {row["id"]: row for row in listed["data"]}
+    assert by_id[first]["tool_call_count"] == 0
+    assert by_id[first]["presentation_tool_call_count"] == 1
+    assert by_id[first]["display_tool_call_count"] == 1
+    assert by_id[second]["tool_call_count"] == 0
+    assert by_id[second]["presentation_tool_call_count"] == 1
+    assert by_id[second]["display_tool_call_count"] == 1
+    assert detail["session"]["tool_call_count"] == 0
+    assert detail["session"]["presentation_tool_call_count"] == 1
+    assert detail["session"]["display_tool_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_sidebar_counts_compression_lineage_with_one_ledger_query(
+    adapter, session_db, monkeypatch
+):
+    root = session_db.create_session("hosted before compression", "api_server")
+    session_db.append_message(root, "user", "before")
+    session_db.end_session(root, "compression")
+    tip = session_db.create_session(
+        "hosted after compression", "api_server", parent_session_id=root
+    )
+    session_db.append_message(tip, "user", "after")
+    ledger = PresentationLedger(session_db.db_path.parent)
+    ledger.start(root, "hosted_root", "web_search", {"query": "root"})
+    ledger.start(tip, "hosted_tip", "web_search", {"query": "tip"})
+
+    calls = []
+    original_count_many = PresentationLedger.count_many
+
+    def counted_count_many(self, session_ids):
+        calls.append(tuple(session_ids))
+        return original_count_many(self, session_ids)
+
+    monkeypatch.setattr(PresentationLedger, "count_many", counted_count_many)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        listed = await (await cli.get("/api/sessions?limit=20")).json()
+        detail = await (await cli.get(f"/api/sessions/{tip}")).json()
+
+    row = next(item for item in listed["data"] if item["id"] == tip)
+    assert row["presentation_tool_call_count"] == 2
+    assert row["display_tool_call_count"] == 2
+    assert detail["session"]["presentation_tool_call_count"] == 2
+    assert len(calls) == 2  # one page aggregate plus one detail aggregate
+    assert set(calls[0]) == {root, tip}
 
 
 @pytest.mark.asyncio

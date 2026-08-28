@@ -812,3 +812,344 @@ class TestProfileScopedAudio:
         assert resp.status_code == 404
         resp = client.post("/api/audio/speak?profile=ghost", json={"text": "x"})
         assert resp.status_code == 404
+
+
+class TestProfileScopedAttachments:
+    """Chat attachments must stay in the profile that owns their prompt."""
+
+    def test_media_reads_the_requested_profiles_roots(self, client, isolated_profiles):
+        image = isolated_profiles["worker_beta"] / "images" / "profile.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"\x89PNG\r\n\x1a\nprofile")
+
+        response = client.get(
+            "/api/media", params={"path": str(image), "profile": "worker_beta"}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data_url"].startswith("data:image/png;base64,")
+        # The dashboard process's default profile must not be able to claim a
+        # named profile's local media solely by knowing an absolute path.
+        assert client.get("/api/media", params={"path": str(image)}).status_code == 403
+
+    def test_managed_upload_is_confined_to_the_requested_profile(
+        self, client, isolated_profiles
+    ):
+        response = client.post(
+            "/api/files/upload",
+            params={"profile": "worker_beta"},
+            json={
+                "path": "uploads/report.txt",
+                "data_url": "data:text/plain;base64,cHJvZmlsZS1vbmx5",
+                "overwrite": False,
+            },
+        )
+
+        assert response.status_code == 200
+        target = isolated_profiles["worker_beta"] / "uploads" / "report.txt"
+        assert response.json()["path"] == str(target)
+        assert target.read_text(encoding="utf-8") == "profile-only"
+        assert not (isolated_profiles["default"] / "uploads" / "report.txt").exists()
+
+    def test_managed_upload_rejects_unknown_profile(self, client, isolated_profiles):
+        response = client.post(
+            "/api/files/upload",
+            params={"profile": "ghost"},
+            json={
+                "path": "uploads/report.txt",
+                "data_url": "data:text/plain;base64,eA==",
+                "overwrite": False,
+            },
+        )
+        assert response.status_code == 404
+
+    def test_managed_upload_rejects_symlink_escape_from_profile_root(
+        self, client, isolated_profiles, tmp_path
+    ):
+        uploads = isolated_profiles["worker_beta"] / "uploads"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        try:
+            uploads.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation unavailable")
+
+        response = client.post(
+            "/api/files/upload",
+            params={"profile": "worker_beta"},
+            json={
+                "path": "uploads/escape.txt",
+                "data_url": "data:text/plain;base64,eA==",
+                "overwrite": False,
+            },
+        )
+
+        assert response.status_code == 403
+        assert not (outside / "escape.txt").exists()
+
+    def test_all_managed_file_routes_stay_in_the_requested_profile(
+        self, client, isolated_profiles
+    ):
+        """Every Files tab operation must use the profile's locked root.
+
+        Uploads already accepted ``profile``.  This pins the read, browse,
+        media, directory creation, and deletion siblings too: they must all
+        interpret a relative path from the same profile home rather than the
+        dashboard process's default home.
+        """
+        worker_home = isolated_profiles["worker_beta"]
+        files = worker_home / "files"
+        files.mkdir()
+        text_file = files / "worker.txt"
+        text_file.write_text("worker-only", encoding="utf-8")
+        audio_file = files / "worker.mp3"
+        audio_file.write_bytes(b"fake-mp3")
+        params = {"profile": "worker_beta"}
+
+        listing = client.get("/api/files", params={**params, "path": "files"})
+        assert listing.status_code == 200
+        body = listing.json()
+        assert body["root"] == str(worker_home)
+        assert body["locked_root"] == str(worker_home)
+        assert body["can_change_path"] is False
+        assert {entry["name"] for entry in body["entries"]} == {
+            "worker.mp3",
+            "worker.txt",
+        }
+        assert all(
+            entry["path"].startswith(f"{worker_home}/") for entry in body["entries"]
+        )
+
+        read = client.get(
+            "/api/files/read", params={**params, "path": "files/worker.txt"}
+        )
+        assert read.status_code == 200
+        assert read.json()["path"] == str(text_file)
+        assert read.json()["data_url"].endswith("d29ya2VyLW9ubHk=")
+
+        download = client.get(
+            "/api/files/download", params={**params, "path": "files/worker.txt"}
+        )
+        assert download.status_code == 200
+        assert download.content == b"worker-only"
+
+        stream = client.get(
+            "/api/files/stream", params={**params, "path": "files/worker.mp3"}
+        )
+        assert stream.status_code == 200
+        assert stream.content == b"fake-mp3"
+
+        mkdir = client.post(
+            "/api/files/mkdir", params=params, json={"path": "files/created"}
+        )
+        assert mkdir.status_code == 200
+        created = files / "created"
+        assert mkdir.json()["path"] == str(created)
+        assert created.is_dir()
+        assert not (isolated_profiles["default"] / "files" / "created").exists()
+
+        delete = client.request(
+            "DELETE", "/api/files", params=params, json={"path": "files/created"}
+        )
+        assert delete.status_code == 200
+        assert delete.json()["path"] == str(created)
+        assert not created.exists()
+
+    def test_managed_file_routes_reject_cross_profile_paths(
+        self, client, isolated_profiles
+    ):
+        """A named profile cannot escape its locked root through any Files route."""
+        default_file = isolated_profiles["default"] / "default-only.txt"
+        default_file.write_text("default-only", encoding="utf-8")
+        worker_home = isolated_profiles["worker_beta"]
+        params = {"profile": "worker_beta", "path": str(default_file)}
+
+        for route in (
+            "/api/files",
+            "/api/files/read",
+            "/api/files/download",
+            "/api/files/stream",
+        ):
+            response = client.get(route, params=params)
+            assert response.status_code == 403, route
+
+        mkdir = client.post(
+            "/api/files/mkdir",
+            params={"profile": "worker_beta"},
+            json={"path": str(isolated_profiles["default"] / "should-not-exist")},
+        )
+        assert mkdir.status_code == 403
+
+        delete = client.request(
+            "DELETE",
+            "/api/files",
+            params={"profile": "worker_beta"},
+            json={"path": str(default_file)},
+        )
+        assert delete.status_code == 403
+        assert default_file.read_text(encoding="utf-8") == "default-only"
+        assert not (isolated_profiles["default"] / "should-not-exist").exists()
+
+    def test_media_rejects_a_profile_root_symlinked_outside_its_home(
+        self, client, isolated_profiles, tmp_path
+    ):
+        images = isolated_profiles["worker_beta"] / "images"
+        outside = tmp_path / "outside-images"
+        outside.mkdir()
+        image = outside / "escape.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\nprofile")
+        try:
+            images.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation unavailable")
+
+        response = client.get(
+            "/api/media", params={"path": str(image), "profile": "worker_beta"}
+        )
+
+        assert response.status_code == 403
+
+
+class TestPresentationToolCounts:
+    """Hosted tool cards survive outside state.db but remain profile-scoped."""
+
+    def test_session_list_and_detail_expose_additive_presentation_counts(
+        self, client, isolated_profiles
+    ):
+        from hermes_state import SessionDB
+        from tui_gateway.presentation_ledger import PresentationLedger
+
+        worker_home = isolated_profiles["worker_beta"]
+        db = SessionDB(worker_home / "state.db")
+        try:
+            session_id = db.create_session("hosted cards", "dashboard")
+            db.append_message(
+                session_id,
+                "assistant",
+                "native tool row",
+                tool_calls=[{"id": "native_1", "type": "function"}],
+            )
+        finally:
+            db.close()
+        PresentationLedger(worker_home).start(
+            session_id,
+            "hosted_batch",
+            "web_search",
+            {"queries": ["one", "two"]},
+            turn_index=1,
+        )
+
+        listed = client.get("/api/sessions", params={"profile": "worker_beta"})
+        assert listed.status_code == 200
+        row = next(item for item in listed.json()["sessions"] if item["id"] == session_id)
+        assert row["tool_call_count"] == 1
+        assert row["presentation_tool_call_count"] == 1
+        assert row["display_tool_call_count"] == 2
+
+        detail = client.get(
+            f"/api/sessions/{session_id}", params={"profile": "worker_beta"}
+        )
+        assert detail.status_code == 200
+        assert detail.json()["tool_call_count"] == 1
+        assert detail.json()["presentation_tool_call_count"] == 1
+        assert detail.json()["display_tool_call_count"] == 2
+
+        # No unscoped/default profile read may borrow the named profile sidecar.
+        assert client.get(f"/api/sessions/{session_id}").status_code == 404
+
+    def test_compression_tip_counts_root_cards_once_in_its_own_profile(
+        self, client, isolated_profiles
+    ):
+        from hermes_state import SessionDB
+        from tui_gateway.presentation_ledger import PresentationLedger
+
+        worker_home = isolated_profiles["worker_beta"]
+        db = SessionDB(worker_home / "state.db")
+        try:
+            root = db.create_session("before compression", "dashboard")
+            db.append_message(root, "user", "before")
+            db.end_session(root, "compression")
+            tip = db.create_session(
+                "after compression", "dashboard", parent_session_id=root
+            )
+            db.append_message(tip, "user", "after")
+        finally:
+            db.close()
+        ledger = PresentationLedger(worker_home)
+        ledger.start(root, "hosted_root", "web_search", {"query": "root"})
+        ledger.start(tip, "hosted_tip", "web_search", {"query": "tip"})
+
+        listed = client.get("/api/sessions", params={"profile": "worker_beta"})
+        assert listed.status_code == 200
+        row = next(item for item in listed.json()["sessions"] if item["id"] == tip)
+        assert row["presentation_tool_call_count"] == 2
+        assert row["display_tool_call_count"] == 2
+
+    def test_history_pagination_reports_preceding_visible_user_turns(
+        self, client, isolated_profiles
+    ):
+        from hermes_state import SessionDB
+
+        worker_home = isolated_profiles["worker_beta"]
+        db = SessionDB(worker_home / "state.db")
+        try:
+            session_id = db.create_session("pagination", "dashboard")
+            db.replace_messages(
+                session_id,
+                [
+                    {"role": "user", "content": "u1"},
+                    {"role": "assistant", "content": "a1"},
+                    {"role": "user", "content": "u2"},
+                    {"role": "assistant", "content": "a2"},
+                    {"role": "user", "content": "u3"},
+                    {"role": "assistant", "content": "a3"},
+                ],
+            )
+        finally:
+            db.close()
+
+        response = client.get(
+            f"/api/sessions/{session_id}/messages",
+            params={"profile": "worker_beta", "limit": 2, "offset": 1, "order": "latest"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["content"] for row in payload["messages"]] == ["a2", "u3"]
+        assert payload["pagination"]["user_turn_offset"] == 2
+
+    def test_compacted_history_hydration_uses_profile_local_compression_lineage(
+        self, client, isolated_profiles
+    ):
+        from hermes_state import SessionDB
+
+        worker_home = isolated_profiles["worker_beta"]
+        db = SessionDB(worker_home / "state.db")
+        try:
+            root = db.create_session("root", "dashboard")
+            db.append_message(root, "user", "worker root u")
+            db.append_message(root, "assistant", "worker root a")
+            db.end_session(root, "compression")
+            tip = db.create_session("tip", "dashboard", parent_session_id=root)
+            db.append_message(tip, "user", "worker tip u")
+            db.append_message(tip, "assistant", "worker tip a")
+        finally:
+            db.close()
+
+        response = client.get(
+            f"/api/sessions/{tip}/messages",
+            params={
+                "profile": "worker_beta",
+                "include_compacted": "true",
+                "limit": 2,
+                "order": "latest",
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["content"] for row in payload["messages"]] == [
+            "worker tip u",
+            "worker tip a",
+        ]
+        assert payload["pagination"]["user_turn_offset"] == 1

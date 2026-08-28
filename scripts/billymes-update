@@ -126,6 +126,38 @@ sync_live_dependencies() {
     )
 }
 
+run_webui_pnpm() {
+    if command -v pnpm >/dev/null 2>&1; then
+        pnpm "$@"
+    else
+        npx --yes pnpm@11.5.1 "$@"
+    fi
+}
+
+sync_webui() {
+    local tree="$1"
+    local build_assets="${2:-1}"
+    [[ -f "$tree/webui/package.json" ]] || return 0
+    echo "→ Syncing billymes-webui dependencies in $tree..."
+    (
+        cd "$tree/webui"
+        run_webui_pnpm install --frozen-lockfile
+        if ((build_assets)); then
+            run_webui_pnpm build
+        fi
+    )
+}
+
+run_webui_regressions() {
+    local tree="$1"
+    [[ -f "$tree/webui/package.json" ]] || return 0
+    echo "→ Running billymes-webui canonical quality gate in $tree..."
+    (
+        cd "$tree/webui"
+        run_webui_pnpm quality
+    )
+}
+
 run_regressions() {
     local tree="$1"
     local python_bin
@@ -169,6 +201,10 @@ run_regressions() {
         scripts/run_tests.sh \
             tests/run_agent/test_streaming.py::TestReasoningStreaming::test_google_thought_content_routes_to_reasoning_stream \
             -q
+        scripts/run_tests.sh \
+            tests/test_presentation_ledger.py \
+            tests/gateway/test_session_api.py \
+            -q
         "$python_bin" -m py_compile \
             agent/codex_runtime.py \
             agent/transports/codex.py \
@@ -180,6 +216,7 @@ run_regressions() {
             tools/nested_tool_presentation.py \
             tui_gateway/server.py
         git diff --check
+        run_webui_regressions "$tree"
     )
 }
 
@@ -199,15 +236,29 @@ run_hermes_cli() {
     fi
 }
 
+install_webui_unit() {
+    local template="$repo/webui/systemd/billymes-ui.service"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local target="$unit_dir/billymes-ui.service"
+    [[ -f "$template" ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if [[ ! -f "$target" ]] || ! cmp -s "$template" "$target"; then
+        echo "→ Installing tracked billymes-ui.service..."
+        install -D -m 0644 "$template" "$target"
+        systemctl --user daemon-reload
+    fi
+}
+
 restart_services_and_check_health() {
     local services=()
     local unit profile active new_pid health_url healthy
     local -A old_pids=()
 
     if ((restart_enabled)) && command -v systemctl >/dev/null 2>&1; then
+        install_webui_unit
         while read -r unit _rest; do
             case "$unit" in
-                hermes-gateway*.service|hermes-serve.service|hermes-dashboard-tailscale.service)
+                hermes-gateway*.service|hermes-serve.service|hermes-dashboard-tailscale.service|billymes-ui.service)
                     services+=("$unit")
                     ;;
             esac
@@ -234,7 +285,7 @@ restart_services_and_check_health() {
                         systemctl --user restart "$unit"
                     fi
                     ;;
-                hermes-serve*.service|hermes-dashboard-tailscale.service)
+                hermes-serve*.service|hermes-dashboard-tailscale.service|billymes-ui.service)
                     systemctl --user restart "$unit"
                     ;;
             esac
@@ -260,7 +311,12 @@ restart_services_and_check_health() {
     fi
 
     command -v curl >/dev/null 2>&1 || die "curl is required for health checks"
-    for health_url in ${BILLYMES_HEALTH_URLS:-http://127.0.0.1:9119/api/health}; do
+    local health_urls="${BILLYMES_HEALTH_URLS:-http://127.0.0.1:9119/api/health}"
+    local ui_health_url="${BILLYMES_UI_HEALTH_URL:-http://127.0.0.1:9219/__health}"
+    if [[ " ${services[*]} " == *" billymes-ui.service "* ]]; then
+        health_urls+=" $ui_health_url"
+    fi
+    for health_url in $health_urls; do
         echo "→ Waiting for $health_url"
         healthy=0
         for _attempt in {1..60}; do
@@ -494,6 +550,8 @@ if [[ -f "$receipt_file" ]]; then
             || die "fork production moved independently during interrupted update"
         echo "→ Resuming interrupted Billymes deployment..."
         sync_live_dependencies "$repo"
+        # The canonical quality gate below performs the production build.
+        sync_webui "$repo" 0
         run_regressions "$repo"
         restart_services_and_check_health
         write_receipt \
@@ -537,6 +595,8 @@ if [[ "$behind" == "0" ]]; then
     preflight_production "$production_ref" "$origin_production_sha"
     echo "→ Validating and publishing the current local deployment..."
     sync_live_dependencies "$repo"
+    # The canonical quality gate below performs the production build.
+    sync_webui "$repo" 0
     run_regressions "$repo"
     restart_services_and_check_health
     write_receipt \
@@ -602,6 +662,11 @@ if ! gitc diff --quiet "$old_production" "$new_production" -- \
     node_manifest_changed=1
 fi
 
+webui_changed=0
+if ! gitc diff --quiet "$old_production" "$new_production" -- webui; then
+    webui_changed=1
+fi
+
 web_changed=0
 if ! gitc diff --quiet "$old_production" "$new_production" -- \
     package.json package-lock.json apps/shared ui-tui/package.json web; then
@@ -624,6 +689,11 @@ fi
 if ((web_changed)); then
     echo "→ Building Dashboard assets in staging..."
     (cd "$staging_dir" && npm run build --workspace web)
+fi
+
+if ((webui_changed)); then
+    # The canonical quality gate below includes the production build.
+    sync_webui "$staging_dir" 0
 fi
 
 [[ -z "$(git -C "$staging_dir" status --porcelain --untracked-files=no)" ]] \
@@ -671,6 +741,7 @@ write_receipt \
 trap - EXIT INT TERM
 
 sync_live_dependencies "$repo"
+sync_webui "$repo"
 restart_services_and_check_health
 write_receipt \
     "$old_production" "$new_production" "$upstream_sha" \

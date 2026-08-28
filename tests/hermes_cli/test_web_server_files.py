@@ -264,6 +264,29 @@ def test_stream_upload_cleans_temp_on_cancellation(forced_files_client):
     assert leftovers == [], f"temp upload files leaked on cancellation: {leftovers}"
 
 
+def test_no_overwrite_upload_claim_is_atomic(forced_files_client):
+    """Concurrent attachment writes cannot bypass ``overwrite=False``."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    _client, root = forced_files_client
+    target = root / "out" / "same-name.txt"
+
+    def upload(data):
+        try:
+            web_server._write_managed_upload_bytes(target, data, overwrite=False)
+            return "written"
+        except web_server.HTTPException as exc:
+            return exc.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(upload, (b"first", b"second")))
+
+    assert results.count("written") == 1
+    assert results.count(409) == 1
+    assert target.read_bytes() in {b"first", b"second"}
+    assert not list(target.parent.glob("*.upload"))
+
+
 def test_sensitive_env_files_hidden_from_listing(forced_files_client):
     """Regression test for #57505: .env files must not appear in directory listings."""
     client, root = forced_files_client
@@ -373,5 +396,4 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     # is filtered because the parent component is a credential dir.
     mcp_listing = client.get("/api/files", params={"path": str(mcp_dir)})
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
-
 

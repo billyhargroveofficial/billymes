@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -7603,6 +7604,123 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _presentation_origin(tool_call_id: str) -> str | None:
+    """Return the display-only card families owned by this gateway."""
+    if tool_call_id.startswith("hosted_"):
+        return "hosted"
+    if tool_call_id.startswith("sandbox_"):
+        return "nested"
+    return None
+
+
+# Terminal provider frames can legitimately be repeated after the agent starts
+# the next turn, so retain a modest replay window instead of immediately
+# forgetting turn ownership.  A session itself may live for days, however;
+# unlike the durable ledger this in-memory correlation cache must not grow with
+# every hosted batch forever.
+_PRESENTATION_TURN_SNAPSHOT_LIMIT = 512
+
+
+def _presentation_ledger_for_session(sid: str):
+    session = _sessions.get(sid) or {}
+    session_key = str(session.get("session_key") or "")
+    if not session_key:
+        return None, ""
+    try:
+        from tui_gateway.presentation_ledger import PresentationLedger
+
+        home = session.get("profile_home") or _hermes_home
+        return PresentationLedger(home), session_key
+    except Exception:
+        logger.debug("presentation ledger unavailable", exc_info=True)
+        return None, ""
+
+
+def _presentation_turn_for_session(sid: str, tool_call_id: str) -> tuple[str | None, int | None]:
+    """Keep a card attached to the turn it started in.
+
+    A callback can finish after the agent has advanced its current-turn fields.
+    The snapshot must remain after a terminal event too: provider-compatible
+    streams sometimes repeat that event after the next turn starts.
+    """
+    session = _sessions.get(sid) or {}
+    snapshots = session.setdefault("presentation_turns", {})
+    existing = snapshots.get(tool_call_id)
+    if isinstance(existing, tuple) and len(existing) == 2:
+        return existing
+    agent = session.get("agent")
+    turn_id = getattr(agent, "_current_turn_id", None)
+    turn_index = getattr(agent, "_user_turn_count", None)
+    snapshot = (
+        str(turn_id) if turn_id else None,
+        int(turn_index)
+        if isinstance(turn_index, int) and not isinstance(turn_index, bool) and turn_index > 0
+        else None,
+    )
+    # Also snapshot a terminal-only provider event. This covers compatible
+    # streams which omit an explicit ``tool.started`` callback entirely.
+    snapshots[tool_call_id] = snapshot
+    while len(snapshots) > _PRESENTATION_TURN_SNAPSHOT_LIMIT:
+        # Regular dicts preserve insertion order.  Evict only the oldest
+        # terminal-replay correlation; fresh cards and their duplicate frames
+        # retain exact turn ownership throughout the bounded window.
+        snapshots.pop(next(iter(snapshots)))
+    return snapshot
+
+
+def _presentation_card_start(sid: str, tool_call_id: str, name: str, args: dict) -> None:
+    if _presentation_origin(tool_call_id) is None:
+        return
+    ledger, session_key = _presentation_ledger_for_session(sid)
+    if ledger is None:
+        return
+    try:
+        turn_id, turn_index = _presentation_turn_for_session(sid, tool_call_id)
+        ledger.start(
+            session_key,
+            tool_call_id,
+            name,
+            args,
+            _tool_ctx(name, args),
+            turn_id=turn_id,
+            turn_index=turn_index,
+        )
+    except Exception:
+        logger.debug("presentation ledger start failed", exc_info=True)
+
+
+def _presentation_card_complete(
+    sid: str,
+    tool_call_id: str,
+    name: str,
+    args: dict,
+    *,
+    duration_s: float | None,
+    is_error: bool,
+    error: str = "",
+) -> None:
+    if _presentation_origin(tool_call_id) is None:
+        return
+    ledger, session_key = _presentation_ledger_for_session(sid)
+    if ledger is None:
+        return
+    try:
+        turn_id, turn_index = _presentation_turn_for_session(sid, tool_call_id)
+        ledger.complete(
+            session_key,
+            tool_call_id,
+            name,
+            args,
+            duration_s=duration_s,
+            is_error=is_error,
+            error=error,
+            turn_id=turn_id,
+            turn_index=turn_index,
+        )
+    except Exception:
+        logger.debug("presentation ledger completion failed", exc_info=True)
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -7617,7 +7735,9 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         # A stable id can be replayed after a reconnect or retry. Never let a
         # stale explicit duration from an abandoned lifecycle leak into it.
         session.setdefault("tool_duration_overrides", {}).pop(tool_call_id, None)
+        session.setdefault("tool_error_overrides", {}).pop(tool_call_id, None)
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
+    _presentation_card_start(sid, tool_call_id, name, args)
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload: dict[str, object] = {
             "tool_id": tool_call_id,
@@ -7646,15 +7766,20 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     snapshot = None
     started_at = None
     duration_override = None
+    error_override = None
     if session is not None:
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
         duration_override = session.setdefault("tool_duration_overrides", {}).pop(
             tool_call_id, None
         )
+        error_override = session.setdefault("tool_error_overrides", {}).pop(
+            tool_call_id, None
+        )
     if (
         isinstance(duration_override, (int, float))
         and not isinstance(duration_override, bool)
+        and math.isfinite(float(duration_override))
         and duration_override >= 0
     ):
         duration_s = float(duration_override)
@@ -7664,6 +7789,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         duration_s = None
     if duration_s is not None:
         payload["duration_s"] = duration_s
+    is_presentation = _presentation_origin(tool_call_id) is not None
+    is_error = bool(error_override.get("is_error")) if isinstance(error_override, dict) else False
+    error_text = str(error_override.get("error") or "") if isinstance(error_override, dict) else ""
+    if is_presentation:
+        payload["ok"] = not is_error
+        payload["status"] = "error" if is_error else "done"
+        if is_error:
+            payload["error"] = error_text or "tool failed"
     try:
         payload["result"] = json.loads(result)
     except Exception:
@@ -7671,6 +7804,16 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    if is_presentation:
+        _presentation_card_complete(
+            sid,
+            tool_call_id,
+            name,
+            args,
+            duration_s=duration_s,
+            is_error=is_error,
+            error=error_text or result,
+        )
     if _session_verbose(sid):
         result_text = _tool_result_text(result)
         if result_text:
@@ -7717,12 +7860,25 @@ def _on_tool_progress(
         tool_call_id = _kwargs.get("tool_call_id")
         duration = _kwargs.get("duration")
         session = _sessions.get(sid)
+        # Preserve provider failure independently from its duration. A missing
+        # duration must not make a failed hosted card look successful.
+        if (
+            session is not None
+            and isinstance(tool_call_id, str)
+            and tool_call_id
+            and _presentation_origin(tool_call_id) is not None
+        ):
+            session.setdefault("tool_error_overrides", {})[tool_call_id] = {
+                "is_error": bool(_kwargs.get("is_error")),
+                "error": str(_kwargs.get("result") or ""),
+            }
         if (
             session is not None
             and isinstance(tool_call_id, str)
             and tool_call_id
             and isinstance(duration, (int, float))
             and not isinstance(duration, bool)
+            and math.isfinite(float(duration))
             and duration >= 0
         ):
             session.setdefault("tool_duration_overrides", {})[tool_call_id] = float(

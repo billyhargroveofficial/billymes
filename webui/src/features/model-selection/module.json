@@ -1,0 +1,5 @@
+{
+  "id": "model-selection",
+  "description": "Model catalog parsing, selection controls, and assignment operations.",
+  "dependencies": []
+}

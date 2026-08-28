@@ -1,0 +1,5 @@
+{
+  "id": "gateway",
+  "description": "Browser-to-Hermes transport, reconnect state, and local gateway settings.",
+  "dependencies": []
+}
