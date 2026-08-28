@@ -11259,6 +11259,48 @@ async def list_oauth_providers(profile: Optional[str] = None):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/api/providers/account-usage")
+async def providers_account_usage(profile: Optional[str] = None):
+    """Subscription usage limits for connected OAuth accounts.
+
+    Read-only and fail-open per provider: a logged-out or unreachable account
+    is simply omitted. Shapes mirror agent.account_usage.AccountUsageSnapshot;
+    the WebUI header renders used_percent per window.
+    """
+    from agent.account_usage import fetch_account_usage
+
+    def _fetch(provider_id: str):
+        with _profile_scope(profile):
+            try:
+                return fetch_account_usage(provider_id)
+            except Exception:
+                return None
+
+    snapshots = await asyncio.gather(
+        *(asyncio.to_thread(_fetch, pid) for pid in ("openai-codex", "anthropic"))
+    )
+    accounts = []
+    for snap in snapshots:
+        if snap is None or not snap.available:
+            continue
+        accounts.append({
+            "provider": snap.provider,
+            "plan": snap.plan,
+            "title": snap.title,
+            "windows": [
+                {
+                    "label": window.label,
+                    "used_percent": window.used_percent,
+                    "reset_at": window.reset_at.isoformat() if window.reset_at else None,
+                    "detail": window.detail,
+                }
+                for window in snap.windows
+            ],
+            "details": list(snap.details),
+        })
+    return {"accounts": accounts}
+
+
 @app.delete("/api/providers/oauth/{provider_id}")
 async def disconnect_oauth_provider(
     provider_id: str,
