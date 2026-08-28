@@ -42,11 +42,18 @@ describe('chat JSON-RPC result contracts', () => {
     expect(
       parseSessionEventsSinceResult({
         latest_seq: 7,
+        durable_seq: 6,
         truncated: false,
         epoch: 'boot-a',
         events: [{ type: 'message.delta', session_id: 'live', seq: 7, payload: { text: 'x' } }],
       }),
-    ).toMatchObject({ latest_seq: 7, epoch: 'boot-a', events: [{ seq: 7 }] })
+    ).toMatchObject({
+      latest_seq: 7,
+      durable_seq: 6,
+      replay_base_seq: 6,
+      epoch: 'boot-a',
+      events: [{ seq: 7 }],
+    })
     expect(
       parseSessionPresentationListResult({
         session_id: 'stored',

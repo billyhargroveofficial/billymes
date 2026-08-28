@@ -85,3 +85,23 @@ contract. Keep hosted Responses calls presentation-only through the event
 ledger, including batch fan-out, terminal-turn reconciliation, and reload
 replay. Never solve a UI reload by adding synthetic provider/tool messages to
 the Hermes transcript.
+
+## Native Codex and replay ownership
+
+The production stack includes the fork's native Codex OAuth transport. It
+keeps a per-conversation Responses WebSocket, uses `previous_response_id` only
+for a verified continuation, selects the lite wire from authenticated catalog
+metadata, keeps hosted-tool requests on classic Responses, and falls back to
+HTTP/SSE without replaying potentially started hosted work. The `codex-native`
+web provider is bundled in this repository; do not recreate the removed
+machine-local override.
+
+The WebUI reload boundary is cursor-based. `session.events.since` atomically
+returns `durable_seq` for successful persistence and `replay_base_seq` for the
+prefix safe to omit after authoritative hydration. Non-durable terminal states
+remain replayable until a following `message.start` explicitly supersedes
+them. REST hydration aligns to the replay base, while the protected current
+tail and concurrent live frames are applied afterward through one sequence
+watermark. Preserve generation ownership, current-tail retention, bounded
+convergence, and fail-closed behavior for a truncated gap. Content-based
+deduplication is not an acceptable substitute.

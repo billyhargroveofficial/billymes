@@ -44,7 +44,7 @@ Registry: `src/app/router/route-registry.tsx`
 - Public entry: `src/features/chat/index.ts`
 - Dependencies: `gateway`, `model-selection`, `profiles`
 - Public exports: `ChatPage`, `ChatRuntimeProvider`
-- Source files: 62
+- Source files: 63
 
 ### `gateway`
 

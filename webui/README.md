@@ -51,6 +51,12 @@ Hermes services.
   tool messages or reissue calls while replaying. Live lifecycle events are the
   fast path; terminal-turn reconciliation repairs a missed WebSocket frame from
   the same durable ledger before a reload.
+- Transcript reload uses the gateway's dual-cursor protocol: `durable_seq`
+  reports successful persistence and `replay_base_seq` marks the prefix safe
+  to omit after hydration. Protected current replay and concurrently buffered
+  socket frames then pass through one monotonic watermark. Do not merge a whole
+  retained ring over REST, deduplicate by message text, let stale reconnect
+  work clear a newer buffer, or claim a truncated sequence gap.
 
 See [`AGENTS.md`](AGENTS.md) for edit ownership and [`docs/README.md`](docs/README.md)
 for the design notes.

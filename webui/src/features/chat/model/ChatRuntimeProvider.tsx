@@ -1,11 +1,10 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { type ConnectionState, type GatewayEvent, useGateway } from '@/features/gateway'
 import { modelKeys, modelSelectionApi } from '@/features/model-selection'
 import { useProfileScope } from '@/features/profiles'
 import { combinedErrorMessage } from '@/shared/lib/error-message'
 import { chatApi } from '../api/chat-api'
-import { reconstructMessages } from './chat-history'
 import { emptyRuntime, mergeRuntime } from './chat-runtime'
 import { ChatRuntimeContext, type ChatRuntimeContextValue } from './chat-runtime-context'
 import { systemMessage } from './chat-messages'
@@ -13,9 +12,7 @@ import { applyGatewayEvent } from './chat-reducer'
 import { eventBelongsToSelection, type SelectedSessions } from './event-scope'
 import {
   parseContextBreakdownResult,
-  parseSessionEventsSinceResult,
   parseSessionPresentationListResult,
-  parseSessionResumeResult,
   parseSessionUsageResult,
   type SessionPresentationCard,
 } from './rpc-contracts'
@@ -27,11 +24,12 @@ import {
 } from './presentation-tools'
 import { readSelectedSession, writeSelectedSession } from './session-selection'
 import { mergeUsage } from './session-utils'
-import { acceptGatewayEvent, replayEpochChanged } from './stream-recovery'
+import { acceptGatewayEvent, ReplayRecoveryBuffer, replayEpochChanged } from './stream-recovery'
 import type { ChatMessage, SessionInfo, SessionRuntime } from './types'
 import { useChatActions } from './use-chat-actions'
 import { useGatewayConnection } from './use-gateway-connection'
 import { useSessionHistory } from './use-session-history'
+import { useReconnectRecovery } from './use-reconnect-recovery'
 
 const EMPTY_SESSIONS: SessionInfo[] = []
 
@@ -68,6 +66,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
   const eventWatermarks = useRef(new Map<string, number>())
   const hydratingOpen = useRef<number | null>(null)
   const bufferedEvents = useRef<GatewayEvent[]>([])
+  const reconnectRecoveryBuffer = useRef(new ReplayRecoveryBuffer())
   const historyPageOffset = useRef(0)
   const historyUserTurnOffset = useRef(0)
   const historyHasEarlierRef = useRef(false)
@@ -133,6 +132,10 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
     if (!eventBelongsToSelection(event, profile, selectedRef.current)) return
     if (hydratingOpen.current != null) {
       bufferedEvents.current.push(event)
+      return
+    }
+    if (event.session_id && reconnectRecoveryBuffer.current.accepts(event.session_id)) {
+      reconnectRecoveryBuffer.current.push(event)
       return
     }
     if (!acceptGatewayEvent(eventWatermarks.current, event)) return
@@ -226,78 +229,27 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       presentationCardsRef.current.get(storedSessionId) ?? [],
       historyUserTurnOffset.current,
     ).messages
-  const selectRecoveredSession = useEffectEvent(selectSessions)
-  const applyRecoveredGatewayEvent = useEffectEvent(handleGatewayEvent)
-  const loadRecoveredPresentation = useEffectEvent(loadPresentation)
-
-  useEffect(() => {
-    if (!connectionGeneration || connectionState !== 'open') return
-    const alreadyConnected = reconnectSeen.current
-    reconnectSeen.current = true
-    if (!alreadyConnected) return
-    const storedSessionId = selectedRef.current.history
-    if (!storedSessionId) return
-    let disposed = false
-    const recover = async () => {
-      try {
-        const resumed = parseSessionResumeResult(
-          await request('session.resume', {
-            session_id: storedSessionId,
-            profile,
-            omit_messages: true,
-          }),
-        )
-        if (disposed || selectedRef.current.history !== storedSessionId || !resumed.session_id)
-          return
-        const durableId = resumed.stored_session_id ?? storedSessionId
-        selectRecoveredSession(resumed.session_id, durableId)
-        if (resumed.info) {
-          setRuntime((previous) =>
-            mergeRuntime(previous, { type: 'session.info', payload: resumed.info }),
-          )
-        }
-        if (resumed.running != null) {
-          setBusy(resumed.running)
-          setRuntime((previous) => ({
-            ...previous,
-            turnStartedAt: resumed.running
-              ? (resumed.turn_started_at ?? previous.turnStartedAt ?? Date.now() / 1000)
-              : null,
-          }))
-        }
-
-        const lastSeen = eventWatermarks.current.get(resumed.session_id) ?? 0
-        const replay = parseSessionEventsSinceResult(
-          await request('session.events.since', {
-            session_id: resumed.session_id,
-            last_seen: lastSeen,
-          }),
-        )
-        if (disposed || selectedRef.current.history !== durableId) return
-        const epochChanged =
-          epochResetPending.current || replayEpochChanged(recoveryEpoch.current, replay.epoch)
-        if (replay.epoch) recoveryEpoch.current = replay.epoch
-        epochResetPending.current = false
-        if (epochChanged) eventWatermarks.current.clear()
-        if (epochChanged || replay.truncated) {
-          const history = await chatApi.messages(durableId, profile)
-          if (disposed || selectedRef.current.history !== durableId) return
-          historyUserTurnOffset.current = history.pagination.user_turn_offset
-          setMessages(reconstructMessages(history.messages))
-        }
-        for (const event of replay.events) applyRecoveredGatewayEvent(event)
-        const watermark = eventWatermarks.current.get(resumed.session_id) ?? 0
-        eventWatermarks.current.set(resumed.session_id, Math.max(watermark, replay.latest_seq))
-        void loadRecoveredPresentation(durableId)
-      } catch {
-        // Keep the reconnect loop alive. A later socket will resume again.
-      }
-    }
-    void recover()
-    return () => {
-      disposed = true
-    }
-  }, [connectionGeneration, connectionState, profile, request])
+  useReconnectRecovery({
+    profile,
+    connectionGeneration,
+    connectionState,
+    request,
+    selected: selectedRef,
+    reconnectSeen,
+    recoveryEpoch,
+    epochResetPending,
+    eventWatermarks,
+    recoveryBuffer: reconnectRecoveryBuffer,
+    historyPageOffset,
+    historyUserTurnOffset,
+    selectSessions,
+    setMessages,
+    setBusy,
+    setRuntime,
+    setEarlierHistoryAvailable,
+    applyEvent: handleGatewayEvent,
+    loadPresentation,
+  })
 
   useEffect(() => {
     const sessionId = selected.live

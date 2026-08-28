@@ -28,8 +28,23 @@ Read `webui/AGENTS.md`; production source stays in this fork and only the
 The WebUI also owns durable session selection, event-sequence replay, bounded
 history pagination, profile-scoped attachments, and key-gated production
 proxying; preserve those contracts when changing chat or transport code.
+For replay, `session.events.since` atomically exposes `durable_seq` (successful
+persistence) and `replay_base_seq` (the prefix safe to omit after hydration or
+explicit supersession). Refresh REST after observing the replay base, drop only
+frames through that base, and then apply the protected current tail plus
+concurrently buffered live frames through the same monotonic sequence gate.
+Reconnect recovery is generation-owned; a stale attempt must not clear a newer
+attempt's buffer. Never content-dedupe assistant text/tools, never advance
+across `truncated`, and never allow an unbounded baseline-stabilization loop.
 For paged history, `include_compacted=true` is a compression-only logical
 root-to-tip display read and `pagination.user_turn_offset` is the count of
 visible user turns before that chronological page. It must be computed from the
 same deduplicated projection the endpoint returns; otherwise hosted cards bind
 to the wrong turn after a reload or an older-page fetch.
+
+The direct `openai-codex` path is also owned code: it uses a persistent native
+Responses WebSocket with strict `previous_response_id` continuation and an
+HTTP/SSE fallback. Catalog-approved lite requests are allowed only when no
+hosted tool is declared; hosted tools remain on classic Responses. Preserve the
+bundled `plugins/web/codex-native` provider and profile-local OAuth behavior;
+do not restore a machine-local override or require `codex app-server`.

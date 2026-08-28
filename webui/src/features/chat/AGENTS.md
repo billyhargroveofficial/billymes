@@ -58,6 +58,17 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
   session, replay `session.events.since`, and let durable history determine
   whether it was accepted. Busy state remains active across a disconnect until
   resume reports the terminal state.
+- Replay is cursor-based, never content-based. Gateway `durable_seq` reports
+  successful persistence; `replay_base_seq` is the prefix safe to omit after
+  hydration or explicit supersession of an old ephemeral terminal. Read that
+  atomic snapshot before refreshing REST, advance the watermark only to its
+  replay base, then apply the protected current tail and concurrently buffered
+  live frames through `acceptGatewayEvent`.
+- A reconnect recovery owns a unique generation token in addition to the
+  session id. Cleanup from a stale same-session attempt must not clear or
+  release the current attempt's live buffer. Baseline convergence is bounded;
+  a truncated post-refresh gap or unstable cursor must fail without claiming
+  unseen `latest_seq` events.
 - `stop()` sends `session.interrupt` for the active live session and clears the
   local busy state. `newChat()` invalidates stale generations and best-effort
   interrupts a busy previous session. Closed/error states must leave the UI
@@ -88,6 +99,8 @@ When changing this feature, maintain focused deterministic tests for:
 - event filtering by profile and selected session;
 - controller persistence when `ChatPage` unmounts and remounts;
 - retry cancellation, socket replacement, and cleanup on unmount;
+- durable replay/REST alignment, epoch reset, active-tail retention,
+  same-session reconnect generations, truncation, and bounded convergence;
 - `stop()`/`newChat()` interrupt behavior and busy-state recovery.
 
 Tests must not open SSH, mint a token, contact a real Hermes gateway, or print

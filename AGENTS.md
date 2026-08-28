@@ -121,6 +121,24 @@ the entire owned series into one unreviewable patch.
 
 ### OpenAI Responses hosted-tool contract
 
+The `openai-codex` OAuth path is a native consumer-Codex transport, not a
+wrapper around `codex app-server`. `agent/codex_websocket.py` owns one
+persistent Responses WebSocket per Hermes conversation, uses
+`previous_response_id` only when the next request is an exact continuation of
+the acknowledged request/output chain, and falls back to a full classic
+Responses request whenever that proof fails. The authenticated model catalog
+decides whether a model may use the lite wire. Requests that declare hosted
+tools stay on classic Responses so provider execution and lifecycle events are
+preserved; HTTP/SSE remains the bounded compatibility fallback. Keep OAuth
+credentials profile-scoped and never copy Codex auth state into repository
+configuration.
+
+The bundled `plugins/web/codex-native` provider is a separate one-shot search
+backend for profiles that select it. It also reuses that profile's Codex OAuth,
+ships with the fork, and must not depend on a machine-local plugin override or
+`codex app-server`. Do not conflate it with the direct hosted-tool path inside a
+normal agent turn.
+
 Hosted tools are executed by OpenAI inside the Responses request. The Hermes
 projection is presentation-only. Preserve all of these invariants:
 
@@ -197,6 +215,37 @@ The main persistence surfaces are `tui_gateway/presentation_ledger.py`,
 contract also lives in `hermes_state.py` and both session HTTP adapters. Do not
 replace this design with fake function/tool transcript messages; that would
 regress the speed and semantics this fork exists to preserve.
+
+### Durable session-event recovery
+
+REST history and the in-process gateway replay ring are two projections of the
+same conversation, not two transcripts to concatenate. Each session event has
+a monotonic `seq`; `session.events.since` returns an atomic snapshot with
+`latest_seq`, process `epoch`, `truncated`, `durable_seq`, and
+`replay_base_seq`. The durable cursor is persistence telemetry and advances
+only on a successful, persisted `message.complete` without a warning. Error,
+interrupted, cancelled, and history-version-mismatch completions remain
+non-durable and replayable. The replay base is the prefix a hydrated client may
+omit: normally it matches durable history, but a later `message.start` may
+explicitly retire the preceding ephemeral terminal while keeping that new
+start and its current tail replayable.
+
+On open/reconnect the WebUI must capture a replay snapshot, refresh REST when
+the replay base is ahead (or the epoch/ring requires it), advance its local
+watermark only to that safe base, and apply the current tail after it. Live
+socket frames received while this happens stay in a separate buffer and pass
+through the same sequence gate after replay. A stale open or reconnect
+generation may never clear a newer generation's buffer. Protect all events
+newer than `replay_base_seq` from settled-history pruning; a long active
+response must not become a permanent sequence gap. Bound baseline
+stabilization and fail without claiming `latest_seq` if a gap or continuously
+moving snapshot cannot be reconciled.
+
+Never replace this protocol with text/content deduplication. Equal assistant
+text, reasoning, or tool previews are legitimate, and content heuristics lose
+turn boundaries. Focused recovery coverage lives in
+`tests/test_tui_gateway_event_replay.py` and
+`webui/src/features/chat/model/stream-recovery.test.ts`.
 
 **Never give up on the right solution.**
 

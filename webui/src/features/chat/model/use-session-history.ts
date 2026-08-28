@@ -14,7 +14,7 @@ import { errorMessage } from '@/shared/lib/error-message'
 import type { SelectedSessions } from './event-scope'
 import { parseSessionEventsSinceResult, parseSessionResumeResult } from './rpc-contracts'
 import { shouldRestoreSelectedSession } from './session-selection'
-import { replayEpochChanged } from './stream-recovery'
+import { recoverDurableReplay, replayEpochChanged } from './stream-recovery'
 import type { ChatMessage, SessionInfo, SessionRuntime } from './types'
 
 type Request = (
@@ -145,7 +145,8 @@ export function useSessionHistory({
       ])
       if (generation !== openGeneration.current) return
 
-      let replayWatermark: { sessionId: string; latestSeq: number } | null = null
+      let replayWatermark: { sessionId: string; cursor: number; latestSeq: number } | null = null
+      let replayEvents: GatewayEvent[] = []
       if (detailResult.status === 'fulfilled') applySession(detailResult.value)
       if (resumeResult.status === 'fulfilled') {
         try {
@@ -180,7 +181,8 @@ export function useSessionHistory({
               if (replay.epoch) recoveryEpoch.current = replay.epoch
               epochResetPending.current = false
               if (epochChanged) eventWatermarks.current.clear()
-              if (epochChanged || replay.truncated) {
+              const recoveryLastSeen = epochChanged ? 0 : lastSeen
+              const refreshHistory = async () => {
                 const refreshed = await chatApi.messages(resumed.stored_session_id ?? id, profile, {
                   limit: HISTORY_PAGE_SIZE,
                   offset: 0,
@@ -194,8 +196,25 @@ export function useSessionHistory({
                   refreshed.pagination.returned >= refreshed.pagination.limit,
                 )
               }
-              bufferedEvents.current = [...replay.events, ...bufferedEvents.current]
-              replayWatermark = { sessionId: resumed.session_id, latestSeq: replay.latest_seq }
+              const recovered = await recoverDurableReplay({
+                initial: replay,
+                lastSeen: recoveryLastSeen,
+                forceRefresh: epochChanged,
+                requestSince: async (cursor) =>
+                  parseSessionEventsSinceResult(
+                    await request('session.events.since', {
+                      session_id: resumed.session_id!,
+                      last_seen: cursor,
+                    }),
+                  ),
+                refreshHistory,
+              })
+              replayEvents = recovered.events
+              replayWatermark = {
+                sessionId: resumed.session_id,
+                cursor: recovered.cursor,
+                latestSeq: recovered.latestSeq,
+              }
             } catch {
               // Event replay is an optional compatibility endpoint; buffered
               // live events still hydrate this session below.
@@ -210,9 +229,22 @@ export function useSessionHistory({
       }
       if (hydratingOpen.current === generation) {
         hydratingOpen.current = null
-        const pendingEvents = bufferedEvents.current
+        const pendingLiveEvents = bufferedEvents.current
         bufferedEvents.current = []
-        for (const event of pendingEvents) handleGatewayEvent(event)
+        if (replayWatermark) {
+          eventWatermarks.current.set(
+            replayWatermark.sessionId,
+            Math.max(
+              eventWatermarks.current.get(replayWatermark.sessionId) ?? 0,
+              replayWatermark.cursor,
+            ),
+          )
+        }
+        for (const event of replayEvents) handleGatewayEvent(event)
+        // Events delivered by the new socket during hydration are not replay:
+        // apply them after the durable replay cursor and let seq watermarks
+        // collapse any overlap with `session.events.since` exactly once.
+        for (const event of pendingLiveEvents) handleGatewayEvent(event)
         if (replayWatermark) {
           eventWatermarks.current.set(
             replayWatermark.sessionId,

@@ -19,6 +19,10 @@ export type SessionResumeResult = {
 export type SessionEventsSinceResult = {
   events: GatewayEvent[]
   latest_seq: number
+  /** Last event already represented by the durable REST session snapshot. */
+  durable_seq: number
+  /** Safe replay discard baseline; may also retire superseded ephemeral work. */
+  replay_base_seq: number
   truncated: boolean
   epoch: string | null
 }
@@ -81,9 +85,15 @@ export function parseSessionEventsSinceResult(value: unknown): SessionEventsSinc
   const eventsRaw = result.events
   if (!Array.isArray(eventsRaw)) throw new ApiPayloadError('session.events.since result.events')
   const events = eventsRaw.map((value, index) => parseGatewayEvent(value, index))
+  const durableSeq =
+    optionalNumber(result.durable_seq, 'session.events.since result.durable_seq') ?? 0
   return {
     events,
     latest_seq: optionalNumber(result.latest_seq, 'session.events.since result.latest_seq') ?? 0,
+    durable_seq: durableSeq,
+    replay_base_seq:
+      optionalNumber(result.replay_base_seq, 'session.events.since result.replay_base_seq') ??
+      durableSeq,
     truncated: optionalBoolean(result.truncated, 'session.events.since result.truncated') ?? false,
     epoch: optionalString(result.epoch, 'session.events.since result.epoch'),
   }
