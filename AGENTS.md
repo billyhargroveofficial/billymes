@@ -2,6 +2,155 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Billymes fork overlay (read this first)
+
+This checkout is not a disposable upstream clone. It is the source tree used by
+the live Billymes deployment and the maintained public fork:
+
+```text
+live checkout             $HOME/.hermes/hermes-agent
+origin                    billyhargroveofficial/billymes
+upstream                  NousResearch/hermes-agent
+upstream/main             canonical upstream
+origin/main               exact upstream mirror (no owned commits)
+origin/billy/production   tested Billymes patch stack and GitHub default branch
+live virtualenv           $HOME/.hermes/hermes-agent/venv
+```
+
+The full branch/update/recovery policy is in `OWNED_PATCHES.md`. Read it before
+changing code, rebasing, updating dependencies, restarting services, or
+publishing. The short version is:
+
+- Never put Billymes changes on `main`. Never push `safety/*` branches.
+- Never run stock `hermes update` from `billy/production`; it assumes an
+  unmodified managed checkout and does not preserve this patch stack.
+- The generic upstream update pipeline and squash-merge recovery instructions
+  later in this file are reference material for upstream clones only. In this
+  live checkout, never use `git reset --hard origin/main`, destructive clean,
+  or a forced checkout to make the tree resemble upstream. Those operations
+  would discard the active owned stack. All upstream integration and release
+  activation must go through the Billymes updater and its isolated worktree.
+- Prefer a separate Git worktree/topic branch for substantial development so
+  an unfinished edit does not alter the live source tree. Integrate a small,
+  independently reviewable commit onto `billy/production` after validation.
+- Keep secrets, OAuth state, profiles, service overrides, logs, sessions, and
+  machine addresses outside Git. Do not paste material from `.env`,
+  `config.yaml`, `auth.json`, systemd drop-ins, or runtime databases into this
+  public repository.
+- Before publication, run `git diff --check upstream/main...HEAD` and
+  `scripts/billymes-update --test`. Use `billymes-update` (or
+  `scripts/billymes-update`) for upstream rebases and live releases. It stages
+  the rebase in an isolated worktree, installs locked dependencies, runs the
+  owned regression gate, activates the tested branch, verifies new service
+  PIDs and health, and only then performs guarded pushes.
+- A failed staging rebase/test must leave the live checkout untouched. A
+  failure after activation is recovered from the private Git receipt on the
+  next updater run. Do not hand-delete that receipt or staging state without
+  first reading `scripts/billymes-update`.
+
+### Live runtime topology
+
+The machine normally has these enabled user services:
+
+```text
+hermes-gateway.service                  default messaging/Telegram gateway
+hermes-gateway-*.service                additional enabled profile gateways
+hermes-serve.service                    official Dashboard backend
+hermes-dashboard-tailscale.service      Tailscale-only Dashboard proxy
+telegram-mcp.service                    shared Telegram account MCP service
+```
+
+Do not hard-code private IPs or credentials in docs/tests. The local wrapper
+`$HOME/.local/bin/billymes-update` supplies machine-specific health URLs and
+the repository path. For diagnosis, prefer `systemctl --user show`,
+`journalctl --user -u <unit>`, and the configured `/api/health` endpoints.
+Restarting a gateway should drain in-flight turns; do not kill it merely to
+make a source edit take effect.
+
+### Owned behavior map
+
+`billy/production` intentionally carries a compact rebased series. At the time
+of writing it covers these behavior classes. Inspect the current range with
+`git log upstream/main..billy/production`; do not copy commit IDs into
+automation:
+
+1. semantic detection of structured tool failures;
+2. model-aware context/reference budgets;
+3. calibrated lookup depth and lazy skill loading;
+4. concurrent Programmatic Tool Calling plus nested tool-card presentation,
+   redaction, cancellation, and read/write exclusion around stateful RPCs;
+5. native OpenAI Responses hosted capabilities projected as Hermes tool cards;
+6. Vertex thought-summary routing and the maintained Gemini model entry;
+7. authenticated loopback/Tailscale Dashboard behavior, subscription usage,
+   and session turn counts;
+8. hardened Telegram documents and rich-message delivery; and
+9. the guarded Billymes updater and focused GitHub regression workflow.
+
+When upstream lands equivalent behavior, remove the corresponding owned commit
+during a reviewed rebase. Do not keep both implementations, and do not squash
+the entire owned series into one unreviewable patch.
+
+### OpenAI Responses hosted-tool contract
+
+Hosted tools are executed by OpenAI inside the Responses request. The Hermes
+projection is presentation-only. Preserve all of these invariants:
+
+- Do not send hosted items through `ToolExecutor`, and do not reconstruct them
+  as Hermes `function_call` objects.
+- Do not inject synthetic assistant/tool-result rows into model history. The
+  provider output remains authoritative, keeping one fast Responses turn and
+  valid replay semantics.
+- A batched `web_search_call.action.queries` fans out into one visible card per
+  query (for example, four queries become four cards) while remaining one
+  provider call.
+- Present provider actions using canonical Hermes names:
+  `web_search`; page open/find as `web_extract`; file search as
+  `search_files`; hosted shell/local shell as `terminal`; code interpreter as
+  `execute_code`; computer as `computer_use`; and image generation as
+  `image_generate`.
+- Start timing from the earliest provider lifecycle event and prefer the
+  explicit provider duration at completion. A fast terminal-only event stream
+  must still create and settle a card, and completed searches must not show
+  `0.0s` merely because all query cards share one provider item.
+- Projection must be idempotent across `added`, `in_progress`, action-specific,
+  `completed`, terminal response, cancellation, and error events. Display
+  metadata must remain redacted.
+
+The main code surfaces are `agent/codex_runtime.py`,
+`agent/transports/codex.py`, `agent/codex_responses_adapter.py`,
+`tui_gateway/server.py`, `agent/display.py`, and
+`ui-tui/src/content/verbs.ts`. The primary regression suite is
+`tests/agent/test_codex_responses_hosted_tool_projection.py`, with transport,
+display, emoji, and TUI duration/context coverage alongside it.
+
+### Known defect: hosted cards disappear after page reload
+
+Live hosted cards currently arrive through observer/WebSocket lifecycle events,
+but those presentation events are not part of the persisted display
+projection. After a browser reload or cold session resume, the Dashboard
+reconstructs the conversation from stored messages; because hosted tools are
+correctly absent from the model transcript, their cards disappear. Execution
+still happened provider-side. This is a persistence/replay defect, not a reason
+to convert hosted calls into local Hermes tools.
+
+The correct fix is a durable, presentation-only event ledger/sidecar keyed by
+session, turn, provider item/call ID, and projected batch member. It must:
+
+1. persist redacted start/complete state, canonical name, safe arguments,
+   status/error, ordering, and explicit duration idempotently;
+2. replay the same cards through the normal Dashboard session-resume/display
+   path after reload and process restart;
+3. never feed those rows to the model, never create a Hermes tool result, and
+   never invoke the local executor;
+4. preserve stable fan-out (one four-query provider item reloads as the same
+   four cards), including cancellation and terminal-only streams; and
+5. have an end-to-end regression: live events -> persisted session -> cold
+   reload -> identical cards/non-zero durations, while the model transcript
+   and normalized function-call count remain free of synthetic hosted rows.
+
+Do not solve the reload symptom by persisting fake function/tool messages.
+That would regress the speed and semantics this fork exists to preserve.
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
