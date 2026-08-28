@@ -18,9 +18,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import SendResult, utf16_len
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _rich_normalize_math_delimiters,
+)
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 
@@ -138,6 +141,61 @@ async def test_plain_markdown_stays_on_legacy_path():
     assert bot is not None
     bot.do_api_request.assert_not_called()
     bot.send_message.assert_awaited()
+
+
+def test_legacy_math_normalization_preserves_inline_and_fenced_code():
+    """Only prose math delimiters are translated for Telegram Rich Markdown."""
+    content = (
+        r"Prose \(x + 1\) and display \[y^2\]." "\n"
+        r"Keep `literal \(not math\)` unchanged." "\n"
+        "```python\n"
+        r"example = r'\[also literal\]'" "\n"
+        "```\n"
+    )
+
+    normalized = _rich_normalize_math_delimiters(content)
+
+    assert "Prose $x + 1$ and display $$y^2$$." in normalized
+    assert r"`literal \(not math\)`" in normalized
+    assert r"example = r'\[also literal\]'" in normalized
+
+
+@pytest.mark.asyncio
+async def test_legacy_math_delimiters_opt_into_rich_delivery():
+    """A normal short prose reply with legacy math uses sendRichMessage."""
+    adapter = _make_adapter()
+    content = r"Euler identity: \(e^{i\pi} + 1 = 0\)."
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert _rich_api_kwargs(adapter)["rich_message"]["markdown"] == (
+        r"Euler identity: $e^{i\pi} + 1 = 0$."
+    )
+
+
+def test_semantic_legacy_chunks_fit_utf16_limit_with_astral_text():
+    """Chunk counters and astral glyphs must never push a legacy chunk over cap."""
+    adapter = _make_adapter(extra={"rich_messages": False})
+    limit = 80
+    content = "\n\n".join(
+        f"Paragraph {index}: " + "😀" * 18
+        for index in range(1, 5)
+    )
+
+    chunks = adapter._format_message_chunks(content, max_length=limit)
+
+    assert len(chunks) == 4
+    assert all(utf16_len(chunk) <= limit for chunk in chunks)
+    assert [chunk.rsplit("\n\n", 1)[-1] for chunk in chunks] == [
+        r"\(1/4\)",
+        r"\(2/4\)",
+        r"\(3/4\)",
+        r"\(4/4\)",
+    ]
+    for index, chunk in enumerate(chunks, start=1):
+        assert f"Paragraph {index}:" in chunk
 
 
 @pytest.mark.asyncio

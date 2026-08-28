@@ -278,6 +278,66 @@ class TestDocumentDownloadBlock:
         assert "could not be downloaded" in (event.text or "")
 
 
+class TestStrictMarkdownDocumentReader:
+    """The opt-in Markdown-only ingress never turns uploads into file paths."""
+
+    @pytest.mark.asyncio
+    async def test_accepts_bounded_utf8_markdown_in_memory(self, adapter):
+        content = b"\xef\xbb\xbf# Title\r\n\r\nUseful notes.\r\n"
+        doc = _make_document(
+            file_name="notes.md",
+            mime_type="text/markdown",
+            file_size=len(content),
+            file_obj=_make_file_obj(content),
+        )
+
+        display_name, decoded, note = await adapter._read_telegram_markdown_document(doc)
+
+        assert display_name == "notes.md"
+        assert decoded == "# Title\n\nUseful notes.\n"
+        assert note is None
+        doc.get_file.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("payload", "message"),
+        [
+            (b"\xff\xfe", "not valid UTF-8"),
+            (b"notes\x00with-control", "binary/control characters"),
+        ],
+    )
+    async def test_rejects_non_text_or_control_characters(self, adapter, payload, message):
+        doc = _make_document(
+            file_name="notes.md",
+            mime_type="text/markdown",
+            file_size=len(payload),
+            file_obj=_make_file_obj(payload),
+        )
+
+        _display_name, decoded, note = await adapter._read_telegram_markdown_document(doc)
+
+        assert decoded is None
+        assert note is not None
+        assert message in note
+
+    @pytest.mark.asyncio
+    async def test_rejects_oversize_before_download(self, adapter):
+        adapter._max_doc_bytes = 1024
+        doc = _make_document(
+            file_name="notes.md",
+            mime_type="text/markdown",
+            file_size=1025,
+            file_obj=_make_file_obj(b"x" * 1025),
+        )
+
+        _display_name, decoded, note = await adapter._read_telegram_markdown_document(doc)
+
+        assert decoded is None
+        assert note is not None
+        assert "no more than 1 KiB" in note
+        doc.get_file.assert_not_awaited()
+
+
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio
     async def test_native_video_is_cached(self, adapter):
