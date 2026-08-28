@@ -39,6 +39,20 @@ persistence) and `replay_base_seq` (the prefix safe to omit after hydration or
 explicit supersession). Refresh REST after observing the replay base, drop only
 frames through that base, and then apply the protected current tail plus
 concurrently buffered live frames through the same monotonic sequence gate.
+For an active F5, REST may already include incrementally persisted active-tail
+rows. Send/apply `session.resume` before a slow messages request so the gateway
+does not orphan-reap a valid reconnect. The gateway's
+`history_anchor_display_key` is a clone-safe immutable key from the exact raw
+display-deduplication identity, never a physical row id or text heuristic;
+`through_display_key` cuts the server history before pagination and returns a
+found marker. Hydrate that bounded prefix, let replay own the active tail, and
+retain the same boundary for older-page requests until a full unbounded rebase.
+If no boundary is confirmed, older-page loading must stay disabled for that
+active projection rather than reintroducing an unbounded persisted tail; a
+later `found=false` page is rejected rather than prepended.
+Even a terminal event at or below the replay base must settle busy/active
+runtime state. Reap grace is only a safety net, not a replacement for this
+ordering.
 Reconnect recovery is generation-owned; a stale attempt must not clear a newer
 attempt's buffer. Never content-dedupe assistant text/tools, never advance
 across `truncated`, and never allow an unbounded baseline-stabilization loop.

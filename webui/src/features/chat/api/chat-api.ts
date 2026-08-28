@@ -1,5 +1,6 @@
 import {
   ApiPayloadError,
+  expectBoolean,
   expectArray,
   expectRecord,
   expectString,
@@ -150,12 +151,19 @@ export const chatApi = {
   messages: async (
     id: string,
     profile?: string,
-    { limit = HISTORY_PAGE_SIZE, offset = 0 }: { limit?: number; offset?: number } = {},
+    {
+      limit = HISTORY_PAGE_SIZE,
+      offset = 0,
+      throughDisplayKey,
+    }: { limit?: number; offset?: number; throughDisplayKey?: string } = {},
   ) => {
+    const through = throughDisplayKey
+      ? `&through_display_key=${encodeURIComponent(throughDisplayKey)}`
+      : ''
     const payload = expectRecord(
       await requestJson(
         withProfile(
-          `/api/sessions/${encodeURIComponent(id)}/messages?include_compacted=true&order=latest&limit=${limit}&offset=${offset}`,
+          `/api/sessions/${encodeURIComponent(id)}/messages?include_compacted=true&order=latest&limit=${limit}&offset=${offset}${through}`,
           profile,
         ),
       ),
@@ -176,6 +184,15 @@ export const chatApi = {
         // Additive pagination metadata. Older Hermes servers did not expose
         // it; zero preserves their full-history and first-page behavior.
         user_turn_offset: numberOr(pagination.user_turn_offset),
+        // Presence differentiates an older endpoint from a requested display
+        // boundary that could not be resolved after compaction.
+        through_display_key_found:
+          pagination.through_display_key_found == null
+            ? undefined
+            : expectBoolean(
+                pagination.through_display_key_found,
+                'messages pagination.through_display_key_found',
+              ),
       },
     }
   },

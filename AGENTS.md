@@ -252,11 +252,47 @@ response must not become a permanent sequence gap. Bound baseline
 stabilization and fail without claiming `latest_seq` if a gap or continuously
 moving snapshot cannot be reconciled.
 
+### Active-turn F5 ownership boundary
+
+An active turn is deliberately represented in both durable REST history and the
+event stream: incremental persistence means REST can already contain part of
+the still-running assistant/tool tail. It is therefore not safe to append a
+whole replay ring to a hydrated page. `session.resume` must be sent and its
+live identity/activity result applied before waiting for a potentially slow
+`/messages` read. Besides making the UI responsive, this releases the gateway
+connection from its orphan-reap path; the configured reap grace is only a
+defence in depth, never the correctness mechanism.
+
+When a turn becomes in-flight, the gateway captures
+`history_anchor_display_key`: an immutable, clone-safe key derived from the
+exact raw display-deduplication identity of the last pre-turn displayed row.
+It is not a SQLite row id, timestamp, text match, or other heuristic, because
+compression may clone history rows and equal display text is valid. The
+messages endpoint accepts that key as `through_display_key`, finds it in the
+logical compression lineage, cuts history through that anchor *before*
+applying pagination, and reports whether the key was found. A missing/invalid
+marker must fail closed to the safe recovery path rather than guessing.
+
+The client uses the server-bounded REST prefix plus the synthetic current user
+turn as its baseline; replay is the sole owner of the active tail. Preserve the
+same `through_display_key` for every `load-earlier` page while that turn is
+active; if that boundary is absent or unconfirmed, disable older-page loading
+instead of paging an unbounded active tail. If an established boundary later
+returns `found=false`, reject that fallback page entirely. Replace the boundary
+only after a full, unbounded rebase. A terminal event also settles runtime
+busy/active state even when its sequence is at or below
+`replay_base_seq` and is correctly omitted from rendering. This prevents both
+the duplicate-tail and permanently-busy variants of F5 recovery.
+
 Never replace this protocol with text/content deduplication. Equal assistant
 text, reasoning, or tool previews are legitimate, and content heuristics lose
 turn boundaries. Focused recovery coverage lives in
-`tests/test_tui_gateway_event_replay.py` and
-`webui/src/features/chat/model/stream-recovery.test.ts`.
+`tests/test_tui_gateway_event_replay.py`,
+`tests/tui_gateway/test_failed_turn_retention.py`,
+`tests/hermes_state/test_session_md_export.py`, the `through_display_key`
+cases in `tests/hermes_cli/test_web_server.py`, and the WebUI chat history,
+RPC, paging, and stream-recovery tests. Keep those cases in the Billymes
+updater gate.
 
 **Never give up on the right solution.**
 

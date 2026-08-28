@@ -2333,6 +2333,178 @@ class TestWebServerEndpoints:
         # summary, live q — chronological order, matching the non-compacted path.
         assert contents == ["summary", "live q"]
 
+    def test_get_session_messages_through_display_key_bounds_before_latest_page(self):
+        """A >500 in-flight tail cannot evict the replay boundary's prefix."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            sid = "display-key-bounded-page"
+            db.create_session(session_id=sid, source="cli")
+            db.append_messages_batch(
+                sid,
+                [{"role": "user", "content": f"prefix {index}"} for index in range(600)],
+            )
+            anchor_id = db.append_message(sid, "assistant", "replay boundary")
+            db.append_messages_batch(
+                sid,
+                [{"role": "assistant", "content": f"active tail {index}"} for index in range(510)],
+            )
+            anchor = next(
+                message
+                for message in db.get_messages(sid, include_display_keys=True)
+                if message["id"] == anchor_id
+            )
+            display_key = anchor["display_key"]
+        finally:
+            db.close()
+
+        response = self.client.get(
+            f"/api/sessions/{sid}/messages?include_compacted=true&order=latest"
+            f"&limit=500&through_display_key={display_key}"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pagination"]["through_display_key_found"] is True
+        assert payload["pagination"]["returned"] == 500
+        assert payload["pagination"]["user_turn_offset"] == 101
+        assert payload["messages"][0]["content"] == "prefix 101"
+        assert payload["messages"][-1]["content"] == "replay boundary"
+        assert not any("active tail" in message["content"] for message in payload["messages"])
+
+        # Pagination stays inside the prefix selected by the same immutable
+        # boundary. Without the server-side cut this second latest page would
+        # overlap the active tail or page against its much newer physical ids.
+        earlier = self.client.get(
+            f"/api/sessions/{sid}/messages?include_compacted=true&order=latest"
+            f"&limit=500&offset=500&through_display_key={display_key}"
+        )
+        assert earlier.status_code == 200
+        earlier_payload = earlier.json()
+        assert earlier_payload["pagination"]["through_display_key_found"] is True
+        assert earlier_payload["pagination"]["returned"] == 101
+        assert earlier_payload["pagination"]["user_turn_offset"] == 0
+        assert earlier_payload["messages"][0]["content"] == "prefix 0"
+        assert earlier_payload["messages"][-1]["content"] == "prefix 100"
+        earlier_contents = {message["content"] for message in earlier_payload["messages"]}
+        first_contents = {message["content"] for message in payload["messages"]}
+        assert earlier_contents.isdisjoint(first_contents)
+        assert not any("active tail" in content for content in earlier_contents)
+
+    def test_get_session_messages_through_display_key_resolves_compaction_clone(self):
+        """A physical pre-compaction id can move while its display key survives."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            sid = "display-key-compaction-clone"
+            db.create_session(session_id=sid, source="cli")
+            watermark_id = db.append_message(sid, "user", "old context")
+            anchor_id = db.append_message(sid, "assistant", "previous final")
+            db.append_message(sid, "assistant", "current active tail")
+            anchor = next(
+                message
+                for message in db.get_messages(sid, include_display_keys=True)
+                if message["id"] == anchor_id
+            )
+            display_key = anchor["display_key"]
+            db.archive_and_compact(
+                sid,
+                [{"role": "assistant", "content": "compaction summary"}],
+                watermark=watermark_id,
+            )
+        finally:
+            db.close()
+
+        response = self.client.get(
+            f"/api/sessions/{sid}/messages?include_compacted=true&order=latest"
+            f"&limit=500&through_display_key={display_key}"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pagination"]["through_display_key_found"] is True
+        assert [message["content"] for message in payload["messages"]] == [
+            "old context",
+            "compaction summary",
+            "previous final",
+        ]
+
+    def test_get_session_messages_through_display_key_preserves_raw_dedupe_distinctions(self):
+        """Semantically equal JSON with different stored ordering is not merged."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            sid = "display-key-raw-tool-order"
+            db.create_session(session_id=sid, source="cli")
+            first_id = db.append_message(
+                sid,
+                "assistant",
+                "same tool call",
+                timestamp=42.0,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            )
+            second_id = db.append_message(
+                sid,
+                "assistant",
+                "same tool call",
+                timestamp=42.0,
+                tool_calls=[
+                    {
+                        "function": {"arguments": "{}", "name": "lookup"},
+                        "id": "call-1",
+                    }
+                ],
+            )
+            db.append_message(sid, "assistant", "active tail")
+            rows = db.get_messages(sid, include_compacted=True, include_display_keys=True)
+            first = next(message for message in rows if message["id"] == first_id)
+            second = next(message for message in rows if message["id"] == second_id)
+            assert first["display_key"] != second["display_key"]
+            display_key = second["display_key"]
+        finally:
+            db.close()
+
+        response = self.client.get(
+            f"/api/sessions/{sid}/messages?include_compacted=true&order=latest"
+            f"&limit=500&through_display_key={display_key}"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pagination"]["through_display_key_found"] is True
+        assert [message["id"] for message in payload["messages"]] == [first_id, second_id]
+        assert not any(message["content"] == "active tail" for message in payload["messages"])
+
+    def test_get_session_messages_unknown_display_key_falls_back_to_normal_page(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="unknown-display-key", source="cli")
+            db.append_message("unknown-display-key", "user", "normal history")
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/sessions/unknown-display-key/messages?include_compacted=true"
+            "&through_display_key=display:v1:" + "0" * 64
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pagination"]["through_display_key_found"] is False
+        assert [message["content"] for message in payload["messages"]] == ["normal history"]
+
+    def test_get_session_messages_rejects_invalid_display_key(self):
+        response = self.client.get(
+            "/api/sessions/missing/messages?include_compacted=true&through_display_key=not-a-key"
+        )
+        assert response.status_code == 422
+
     def test_get_session_messages_omitted_limit_defaults_to_500(self):
         """The dashboard must never load an entire unbounded transcript."""
         from hermes_state import SessionDB
@@ -2359,6 +2531,7 @@ class TestWebServerEndpoints:
             "order": "latest",
             "returned": 500,
             "user_turn_offset": 1,
+            "through_display_key_found": None,
         }
         assert len(payload["messages"]) == 500
         assert payload["messages"][0]["content"] == "msg 1"

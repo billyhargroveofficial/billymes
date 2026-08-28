@@ -11617,6 +11617,91 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         return self.latest_message_row_id(session_id, role="user")
 
+    def _display_dedupe_tuple_from_stored_row(self, row: Any) -> tuple[Any, ...]:
+        """The exact existing ``include_compacted`` equivalence for one row.
+
+        This intentionally operates on SQLite's stored representation:
+        ``tool_calls`` remains raw JSON (including its object-key order) and
+        ordinary content remains encoded.  A visible key must never merge rows
+        the display-history dedupe would keep distinct.
+        """
+        dedupe_content = row["content"]
+        if row["role"] == "user":
+            from agent.context_compressor import split_user_originated_turn
+
+            candidate = {
+                "role": "user",
+                "content": self._decode_content(row["content"]),
+                "display_kind": row["display_kind"],
+                "display_metadata": self._decode_display_metadata(
+                    row["display_metadata"]
+                ),
+            }
+            handoff, live_view = split_user_originated_turn(candidate)
+            if handoff is not None and live_view is not None:
+                dedupe_content = self._encode_content(live_view.get("content"))
+        return (
+            row["role"],
+            dedupe_content,
+            row["timestamp"],
+            row["tool_call_id"],
+            row["tool_calls"],
+            row["tool_name"],
+        )
+
+    def _display_message_key_from_stored_row(self, row: Any) -> str:
+        """Opaque key for the exact stored-row display-dedupe tuple.
+
+        Do not derive this from a decoded API message: decoding tool-call JSON
+        can erase an order distinction which :meth:`get_messages` deliberately
+        preserves when deciding whether two display rows are separate.
+        """
+        identity = self._display_dedupe_tuple_from_stored_row(row)
+        encoded_parts = []
+        for value in identity:
+            payload = f"{type(value).__name__}:{value!r}".encode(
+                "utf-8", "backslashreplace"
+            )
+            encoded_parts.append(len(payload).to_bytes(8, "big") + payload)
+        return "display:v1:" + hashlib.sha256(b"".join(encoded_parts)).hexdigest()
+
+    def latest_active_display_anchor(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the exact-session active display boundary in one read.
+
+        This deliberately does **not** resolve compression lineage or inspect
+        session metadata.  It is called while the gateway's history lock is
+        held immediately before a new turn is persisted, so it must remain one
+        cheap exact-session query and must not flush or otherwise mutate state.
+        ``row_id`` is diagnostic only; ``display_key`` is the stable recovery
+        anchor clients should use across compaction and session cloning.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT id, role, content, timestamp, tool_call_id, tool_calls, "
+                "tool_name, display_kind, display_metadata "
+                "FROM messages WHERE session_id = ? AND active = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "row_id": int(row["id"]),
+            "display_key": self._display_message_key_from_stored_row(row),
+        }
+
+    def latest_active_display_row_id(self, session_id: str) -> Optional[int]:
+        """Diagnostic physical id of :meth:`latest_active_display_anchor`.
+
+        This compatibility helper addresses the exact session only.  Its row
+        id is not durable across compaction and must not be used as a replay
+        cursor; use ``latest_active_display_anchor()['display_key']`` instead.
+        """
+        anchor = self.latest_active_display_anchor(session_id)
+        return anchor["row_id"] if anchor is not None else None
+
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``.
 
@@ -12082,6 +12167,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         latest: bool = False,
         after_id: Optional[int] = None,
         include_ancestors: bool = False,
+        include_display_keys: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -12118,6 +12204,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``after_id`` enables keyset pagination (``id > after_id``): O(1)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
+
+        ``include_display_keys=True`` adds ``display_key`` to each selected
+        result.  The opaque key is computed from the exact stored-row identity
+        used by compacted display deduplication, before JSON decoding; clients
+        can use it to find a history anchor across compaction clones.
         """
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
@@ -12163,35 +12254,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 all_rows = cursor.fetchall()
             seen: dict = {}
             for row in all_rows:
-                dedupe_content = row["content"]
-                if row["role"] == "user":
-                    from agent.context_compressor import split_user_originated_turn
-
-                    candidate = {
-                        "role": "user",
-                        "content": self._decode_content(row["content"]),
-                        "display_kind": row["display_kind"],
-                        "display_metadata": self._decode_display_metadata(
-                            row["display_metadata"]
-                        ),
-                    }
-                    handoff, live_view = split_user_originated_turn(candidate)
-                    if handoff is not None and live_view is not None:
-                        dedupe_content = self._encode_content(
-                            live_view.get("content")
-                        )
-                # Tool fields participate in the dedupe key: compaction copies
-                # them verbatim, so identical tool messages across generations
-                # still collapse, while distinct tool calls that happen to
-                # share role/content/timestamp are never merged.
-                key = (
-                    row["role"],
-                    dedupe_content,
-                    row["timestamp"],
-                    row["tool_call_id"],
-                    row["tool_calls"],
-                    row["tool_name"],
-                )
+                key = self._display_dedupe_tuple_from_stored_row(row)
                 cur = seen.get(key)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
@@ -12216,6 +12279,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         result = []
         for row in rows:
             msg = dict(row)
+            if include_display_keys:
+                msg["display_key"] = self._display_message_key_from_stored_row(row)
             if msg.pop("_compressed_summary", 0):
                 msg["_compressed_summary"] = True
             if "content" in msg:

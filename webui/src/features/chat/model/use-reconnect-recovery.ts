@@ -7,7 +7,11 @@ import {
 } from 'react'
 import type { ConnectionState, GatewayEvent } from '@/features/gateway'
 import { chatApi } from '../api/chat-api'
-import { reconstructMessages } from './chat-history'
+import {
+  reconstructActiveReplayHistory,
+  reconstructMessages,
+  resolveReplayHistoryPaging,
+} from './chat-history'
 import { mergeRuntime } from './chat-runtime'
 import { parseSessionEventsSinceResult, parseSessionResumeResult } from './rpc-contracts'
 import { recoverDurableReplay, ReplayRecoveryBuffer, replayEpochChanged } from './stream-recovery'
@@ -29,6 +33,7 @@ type Options = {
   recoveryBuffer: MutableRefObject<ReplayRecoveryBuffer>
   historyPageOffset: MutableRefObject<number>
   historyUserTurnOffset: MutableRefObject<number>
+  historyThroughDisplayKey: MutableRefObject<string | null>
   selectSessions: (live: string | null, history: string | null) => void
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>
   setBusy: Dispatch<SetStateAction<boolean>>
@@ -102,6 +107,7 @@ export function useReconnectRecovery(options: Options) {
           initial: replay,
           lastSeen: epochChanged ? 0 : lastSeen,
           forceRefresh: epochChanged,
+          initialActiveTurn: resumed.running === true,
           requestSince: async (cursor) =>
             parseSessionEventsSinceResult(
               await state.request('session.events.since', {
@@ -109,22 +115,47 @@ export function useReconnectRecovery(options: Options) {
                 last_seen: cursor,
               }),
             ),
-          refreshHistory: async () => {
-            const history = await chatApi.messages(durableId, state.profile)
+          refreshHistory: async ({ omitActiveReplayTail: omitTail }) => {
+            const throughDisplayKey =
+              omitTail && typeof resumed.inflight?.history_anchor_display_key === 'string'
+                ? resumed.inflight.history_anchor_display_key
+                : undefined
+            const history = await chatApi.messages(durableId, state.profile, {
+              ...(throughDisplayKey ? { throughDisplayKey } : {}),
+            })
             if (disposed || state.selected.current.history !== durableId) return
-            state.historyPageOffset.current =
-              history.pagination.offset + history.pagination.returned
-            state.historyUserTurnOffset.current = history.pagination.user_turn_offset
-            state.setEarlierHistoryAvailable(
-              history.pagination.returned >= history.pagination.limit,
+            const paging = resolveReplayHistoryPaging(history.pagination, {
+              omitActiveReplayTail: omitTail,
+              historyAnchorDisplayKey: resumed.inflight?.history_anchor_display_key,
+              throughDisplayKeyFound: history.pagination.through_display_key_found === true,
+            })
+            state.historyPageOffset.current = paging.pageOffset
+            state.historyUserTurnOffset.current = paging.userTurnOffset
+            state.historyThroughDisplayKey.current = paging.throughDisplayKey
+            state.setEarlierHistoryAvailable(paging.hasEarlier)
+            state.setMessages(
+              omitTail
+                ? reconstructActiveReplayHistory(history.messages, {
+                    historyAnchorDisplayKey: resumed.inflight?.history_anchor_display_key,
+                    throughDisplayKeyFound: history.pagination.through_display_key_found === true,
+                    inflightUser: resumed.inflight?.user ?? null,
+                    turnStartedAt: resumed.turn_started_at,
+                  })
+                : reconstructMessages(history.messages),
             )
-            state.setMessages(reconstructMessages(history.messages))
           },
         })
         if (disposed || state.selected.current.history !== durableId) {
           take()
           return
         }
+        state.setBusy(recovered.activeTurn)
+        state.setRuntime((previous) => ({
+          ...previous,
+          turnStartedAt: recovered.activeTurn
+            ? (resumed.turn_started_at ?? previous.turnStartedAt ?? Date.now() / 1000)
+            : null,
+        }))
         const pending = take()
         state.eventWatermarks.current.set(
           resumed.session_id,

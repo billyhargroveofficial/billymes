@@ -61,6 +61,19 @@ Hermes services.
   socket frames then pass through one monotonic watermark. Do not merge a whole
   retained ring over REST, deduplicate by message text, let stale reconnect
   work clear a newer buffer, or claim a truncated sequence gap.
+- During an active-turn F5, REST may already contain incrementally persisted
+  assistant/tool rows. Apply `session.resume` before awaiting a slow history
+  request so the gateway retains the live turn, then hydrate only the pre-turn
+  prefix using its `history_anchor_display_key` as `through_display_key`.
+  That clone-safe immutable key derives from the exact raw display-dedupe
+  identity—not a row id, timestamp, or message text—and the server cuts before
+  pagination and reports whether it found the anchor. Replay is the sole owner
+  of the active tail; carry the same boundary into every `load-earlier` request
+  until a full unbounded rebase, and disable older-page loading while no exact
+  active boundary is confirmed. A terminal frame still clears busy/active
+  state even if it is at or below the replay base; an older-page response that
+  loses its found marker is rejected, not prepended. The orphan-reap grace is
+  only a fallback guardrail, not the recovery design.
 
 See [`AGENTS.md`](AGENTS.md) for edit ownership and [`docs/README.md`](docs/README.md)
 for the design notes.

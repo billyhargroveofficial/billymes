@@ -84,6 +84,124 @@ function lastAssistant(out: ChatMessage[]) {
   return null
 }
 
+/**
+ * A running agent persists ordinary assistant/tool rows before its terminal
+ * event.  Those rows are useful after a process death, but on a live reload
+ * they overlap the exact event-replay tail.  Keep the durable conversation
+ * through the current user turn and let the sequenced replay reconstruct only
+ * that in-flight tail.
+ *
+ * This is deliberately a role/row boundary, never a content comparison:
+ * identical text and tool previews are valid in different turns.  A missing
+ * user anchor is left untouched as a conservative compatibility fallback for
+ * older gateways that have not persisted the submitted prompt yet.
+ */
+export function omitActiveReplayTail(rows: SessionMessage[]): SessionMessage[] {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    if (rows[index]?.role === 'user') return rows.slice(0, index + 1)
+  }
+  return rows
+}
+
+type ActiveReplayHistory = {
+  /**
+   * Stable display-lineage boundary supplied by newer gateways. It is never
+   * compared to SQLite row ids: compaction can clone/reorder physical rows.
+   */
+  historyAnchorDisplayKey: string | null | undefined
+  /** The bounded endpoint confirmed that `rows` ends at the display key. */
+  throughDisplayKeyFound: boolean
+  /** The current prompt survives even when its partially persisted row is cut. */
+  inflightUser: string | null
+  turnStartedAt: number | null
+}
+
+type HistoryPagination = {
+  limit: number
+  offset: number
+  returned: number
+  user_turn_offset: number
+}
+
+/**
+ * Keep older-page reads on the same authoritative prefix as active replay.
+ * Without a confirmed string boundary there is no safe second page: an
+ * unbounded page can contain the persisted active tail that reconstruction
+ * intentionally discarded. Explicit `null` is the exact empty prefix of a
+ * first turn, while undefined/missing anchors retain only the current page's
+ * structural compatibility fallback.
+ */
+export function resolveReplayHistoryPaging(
+  pagination: HistoryPagination,
+  {
+    omitActiveReplayTail,
+    historyAnchorDisplayKey,
+    throughDisplayKeyFound,
+  }: Pick<ActiveReplayHistory, 'historyAnchorDisplayKey' | 'throughDisplayKeyFound'> & {
+    omitActiveReplayTail: boolean
+  },
+) {
+  const hasBoundedPrefix = typeof historyAnchorDisplayKey === 'string' && throughDisplayKeyFound
+  const pagingIsSafe = !omitActiveReplayTail || hasBoundedPrefix
+  return {
+    pageOffset: pagingIsSafe ? pagination.offset + pagination.returned : 0,
+    userTurnOffset:
+      omitActiveReplayTail && historyAnchorDisplayKey === null ? 0 : pagination.user_turn_offset,
+    throughDisplayKey: omitActiveReplayTail && hasBoundedPrefix ? historyAnchorDisplayKey : null,
+    hasEarlier: pagingIsSafe && pagination.returned >= pagination.limit,
+  }
+}
+
+/** Reject an unbounded fallback page after an active prefix was established. */
+export function earlierHistoryPageMatchesBoundary(
+  throughDisplayKey: string | null,
+  throughDisplayKeyFound: boolean | undefined,
+) {
+  return throughDisplayKey == null || throughDisplayKeyFound === true
+}
+
+/**
+ * Reconstruct a REST snapshot that will be followed by the current event
+ * replay. New gateways supply a stable display key and the server returns the
+ * prefix through that key. Do not infer this prefix from physical row ids:
+ * compression may clone rows. Older gateways retain the conservative
+ * last-user fallback above.
+ */
+export function reconstructActiveReplayHistory(
+  rows: SessionMessage[],
+  {
+    historyAnchorDisplayKey,
+    throughDisplayKeyFound,
+    inflightUser,
+    turnStartedAt,
+  }: ActiveReplayHistory,
+): ChatMessage[] {
+  // `undefined` is the old gateway contract: do not guess beyond the
+  // conservative last-user boundary. `null` is a newer gateway's exact
+  // before-first-row anchor, so an active first turn still gets its prompt.
+  if (
+    historyAnchorDisplayKey === undefined ||
+    inflightUser == null ||
+    (historyAnchorDisplayKey !== null && !throughDisplayKeyFound)
+  ) {
+    return reconstructMessages(omitActiveReplayTail(rows))
+  }
+
+  const messages = reconstructMessages(historyAnchorDisplayKey == null ? [] : rows)
+  messages.push({
+    localId: `inflight-user-after-${historyAnchorDisplayKey ?? 'start'}`,
+    role: 'user',
+    content: inflightUser,
+    thinking: '',
+    tools: [],
+    todos: [],
+    subagents: [],
+    streaming: false,
+    ...(turnStartedAt == null ? {} : { timestamp: turnStartedAt }),
+  })
+  return messages
+}
+
 export function reconstructMessages(rows: SessionMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
   const toolsById = new Map<string, ToolCall>()

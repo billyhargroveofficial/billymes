@@ -8,11 +8,22 @@ import {
 } from 'react'
 import type { ConnectionState, GatewayEvent } from '@/features/gateway'
 import { chatApi, HISTORY_PAGE_SIZE } from '../api/chat-api'
-import { prependHistoricalMessages, reconstructMessages } from './chat-history'
-import { DEFAULT_CONTEXT_WINDOW, mergeRuntime, usageFromSession } from './chat-runtime'
+import {
+  earlierHistoryPageMatchesBoundary,
+  prependHistoricalMessages,
+  reconstructActiveReplayHistory,
+  reconstructMessages,
+  resolveReplayHistoryPaging,
+} from './chat-history'
+import { DEFAULT_CONTEXT_WINDOW, usageFromSession } from './chat-runtime'
 import { errorMessage } from '@/shared/lib/error-message'
 import type { SelectedSessions } from './event-scope'
-import { parseSessionEventsSinceResult, parseSessionResumeResult } from './rpc-contracts'
+import {
+  parseSessionEventsSinceResult,
+  parseSessionResumeResult,
+  type SessionResumeResult,
+} from './rpc-contracts'
+import { applyOpenSessionResume, startSessionOpenRequests } from './session-open-recovery'
 import { shouldRestoreSelectedSession } from './session-selection'
 import { recoverDurableReplay, replayEpochChanged } from './stream-recovery'
 import type { ChatMessage, SessionInfo, SessionRuntime } from './types'
@@ -31,6 +42,7 @@ type HistoryRefs = {
   bufferedEvents: MutableRefObject<GatewayEvent[]>
   historyPageOffset: MutableRefObject<number>
   historyUserTurnOffset: MutableRefObject<number>
+  historyThroughDisplayKey: MutableRefObject<string | null>
   historyHasEarlier: MutableRefObject<boolean>
   historyPageLoading: MutableRefObject<boolean>
   eventWatermarks: MutableRefObject<Map<string, number>>
@@ -93,6 +105,7 @@ export function useSessionHistory({
     bufferedEvents,
     historyPageOffset,
     historyUserTurnOffset,
+    historyThroughDisplayKey,
     historyHasEarlier,
     historyPageLoading,
     eventWatermarks,
@@ -109,17 +122,58 @@ export function useSessionHistory({
     bufferedEvents.current = []
     historyPageOffset.current = 0
     historyUserTurnOffset.current = 0
+    historyThroughDisplayKey.current = null
     setEarlierHistoryAvailable(false)
     setMessages([])
     setBusy(false)
     setHistoryReady(false)
     try {
-      const data = await chatApi.messages(id, profile, { limit: HISTORY_PAGE_SIZE, offset: 0 })
+      const openRequests = startSessionOpenRequests(profile, id, request)
+      const applyResumedSession = (resumed: SessionResumeResult) => {
+        applyOpenSessionResume(resumed, {
+          id,
+          isCurrent: () => generation === openGeneration.current,
+          selectSessions,
+          setBusy,
+          setRuntime,
+        })
+      }
+      void openRequests.resume.then(
+        (value) => {
+          if (generation !== openGeneration.current) return
+          try {
+            applyResumedSession(parseSessionResumeResult(value))
+          } catch {}
+        },
+        () => undefined,
+      )
+      const data = await openRequests.history
       if (generation !== openGeneration.current) return
-      setMessages(reconstructMessages(data.messages))
       historyPageOffset.current = data.pagination.offset + data.pagination.returned
       historyUserTurnOffset.current = data.pagination.user_turn_offset
       setEarlierHistoryAvailable(data.pagination.returned >= data.pagination.limit)
+
+      const applyHistory = (
+        history: typeof data,
+        options: {
+          omitActiveReplayTail: boolean
+          historyAnchorDisplayKey: string | null | undefined
+          throughDisplayKeyFound: boolean
+          inflightUser: string | null
+          turnStartedAt: number | null
+        },
+      ) => {
+        const paging = resolveReplayHistoryPaging(history.pagination, options)
+        setMessages(
+          options.omitActiveReplayTail
+            ? reconstructActiveReplayHistory(history.messages, options)
+            : reconstructMessages(history.messages),
+        )
+        historyPageOffset.current = paging.pageOffset
+        historyUserTurnOffset.current = paging.userTurnOffset
+        historyThroughDisplayKey.current = paging.throughDisplayKey
+        setEarlierHistoryAvailable(paging.hasEarlier)
+      }
 
       const applySession = (detail: SessionInfo) => {
         if (generation !== openGeneration.current) return
@@ -129,44 +183,44 @@ export function useSessionHistory({
           provider: detail.billing_provider || previous.provider,
           usage: usageFromSession(detail, contextWindow || DEFAULT_CONTEXT_WINDOW),
           sessionStartedAt: detail.started_at,
-          turnStartedAt: null,
+          turnStartedAt: previous.turnStartedAt,
           contextWindow: contextWindow || DEFAULT_CONTEXT_WINDOW,
         }))
       }
       const row = sessions.find((session) => session.id === id)
       if (row) applySession(row)
 
-      // Do not expose a sendable session until both asynchronous hydration
-      // branches have settled. Otherwise a prompt can be added while detail
-      // or resume is still pending, and a late result can replace its state.
       const [detailResult, resumeResult] = await Promise.allSettled([
-        chatApi.detail(id, profile),
-        request('session.resume', { session_id: id, profile, omit_messages: true }),
+        openRequests.detail,
+        openRequests.resume,
       ])
       if (generation !== openGeneration.current) return
 
       let replayWatermark: { sessionId: string; cursor: number; latestSeq: number } | null = null
       let replayEvents: GatewayEvent[] = []
+      let historyHydratedByRecovery = false
+      let initialReplayHasActiveTail = false
+      let initialHistory = data
+      let historySessionId = id
+      let activeReplayHistory = {
+        historyAnchorDisplayKey: undefined as string | null | undefined,
+        throughDisplayKeyFound: false,
+        inflightUser: null as string | null,
+        turnStartedAt: null as number | null,
+      }
       if (detailResult.status === 'fulfilled') applySession(detailResult.value)
       if (resumeResult.status === 'fulfilled') {
         try {
           const resumed = parseSessionResumeResult(resumeResult.value)
-          if (resumed.session_id)
-            selectSessions(resumed.session_id, resumed.stored_session_id ?? id)
-          if (resumed.info) {
-            setRuntime((previous) =>
-              mergeRuntime(previous, { type: 'session.info', payload: resumed.info }),
-            )
+          applyResumedSession(resumed)
+          historySessionId = resumed.stored_session_id ?? id
+          activeReplayHistory = {
+            historyAnchorDisplayKey: resumed.inflight?.history_anchor_display_key,
+            throughDisplayKeyFound: false,
+            inflightUser: resumed.inflight?.user ?? null,
+            turnStartedAt: resumed.turn_started_at,
           }
-          if (resumed.running != null) {
-            setBusy(resumed.running)
-            setRuntime((previous) => ({
-              ...previous,
-              turnStartedAt: resumed.running
-                ? (resumed.turn_started_at ?? previous.turnStartedAt ?? Date.now() / 1000)
-                : null,
-            }))
-          }
+          initialReplayHasActiveTail = resumed.running === true
           if (resumed.session_id) {
             try {
               const lastSeen = eventWatermarks.current.get(resumed.session_id) ?? 0
@@ -182,24 +236,33 @@ export function useSessionHistory({
               epochResetPending.current = false
               if (epochChanged) eventWatermarks.current.clear()
               const recoveryLastSeen = epochChanged ? 0 : lastSeen
-              const refreshHistory = async () => {
+              const refreshHistory = async ({
+                omitActiveReplayTail: omitTail,
+              }: {
+                omitActiveReplayTail: boolean
+              }) => {
+                const throughDisplayKey =
+                  omitTail && typeof activeReplayHistory.historyAnchorDisplayKey === 'string'
+                    ? activeReplayHistory.historyAnchorDisplayKey
+                    : undefined
                 const refreshed = await chatApi.messages(resumed.stored_session_id ?? id, profile, {
                   limit: HISTORY_PAGE_SIZE,
                   offset: 0,
+                  ...(throughDisplayKey ? { throughDisplayKey } : {}),
                 })
                 if (generation !== openGeneration.current) return
-                setMessages(reconstructMessages(refreshed.messages))
-                historyPageOffset.current =
-                  refreshed.pagination.offset + refreshed.pagination.returned
-                historyUserTurnOffset.current = refreshed.pagination.user_turn_offset
-                setEarlierHistoryAvailable(
-                  refreshed.pagination.returned >= refreshed.pagination.limit,
-                )
+                historyHydratedByRecovery = true
+                applyHistory(refreshed, {
+                  omitActiveReplayTail: omitTail,
+                  ...activeReplayHistory,
+                  throughDisplayKeyFound: refreshed.pagination.through_display_key_found === true,
+                })
               }
               const recovered = await recoverDurableReplay({
                 initial: replay,
                 lastSeen: recoveryLastSeen,
                 forceRefresh: epochChanged,
+                initialActiveTurn: resumed.running === true,
                 requestSince: async (cursor) =>
                   parseSessionEventsSinceResult(
                     await request('session.events.since', {
@@ -210,15 +273,20 @@ export function useSessionHistory({
                 refreshHistory,
               })
               replayEvents = recovered.events
+              initialReplayHasActiveTail = recovered.activeTurn
+              setBusy(recovered.activeTurn)
+              setRuntime((previous) => ({
+                ...previous,
+                turnStartedAt: recovered.activeTurn
+                  ? (resumed.turn_started_at ?? previous.turnStartedAt ?? Date.now() / 1000)
+                  : null,
+              }))
               replayWatermark = {
                 sessionId: resumed.session_id,
                 cursor: recovered.cursor,
                 latestSeq: recovered.latestSeq,
               }
-            } catch {
-              // Event replay is an optional compatibility endpoint; buffered
-              // live events still hydrate this session below.
-            }
+            } catch {}
           }
         } catch (error) {
           setMessages((current) => [
@@ -226,6 +294,31 @@ export function useSessionHistory({
             makeSystemMessage(errorMessage(error, 'некорректный ответ session.resume')),
           ])
         }
+      }
+      if (
+        !historyHydratedByRecovery &&
+        initialReplayHasActiveTail &&
+        typeof activeReplayHistory.historyAnchorDisplayKey === 'string'
+      ) {
+        try {
+          initialHistory = await chatApi.messages(historySessionId, profile, {
+            limit: HISTORY_PAGE_SIZE,
+            offset: 0,
+            throughDisplayKey: activeReplayHistory.historyAnchorDisplayKey,
+          })
+          if (generation !== openGeneration.current) return
+          activeReplayHistory.throughDisplayKeyFound =
+            initialHistory.pagination.through_display_key_found === true
+        } catch {
+          // Newer boundary parameters are additive. An old/rejecting endpoint
+          // falls back to the structural role boundary, never text matching.
+        }
+      }
+      if (!historyHydratedByRecovery) {
+        applyHistory(initialHistory, {
+          omitActiveReplayTail: initialReplayHasActiveTail,
+          ...activeReplayHistory,
+        })
       }
       if (hydratingOpen.current === generation) {
         hydratingOpen.current = null
@@ -276,15 +369,32 @@ export function useSessionHistory({
     }
     const generation = openGeneration.current
     const offset = historyPageOffset.current
+    const throughDisplayKey = historyThroughDisplayKey.current
     historyPageLoading.current = true
     setLoadingEarlierMessages(true)
     try {
       const page = await chatApi.messages(storedSessionId, profile, {
         limit: HISTORY_PAGE_SIZE,
         offset,
+        ...(throughDisplayKey ? { throughDisplayKey } : {}),
       })
       if (generation !== openGeneration.current || selectedRef.current.history !== storedSessionId)
         return 0
+      if (
+        !earlierHistoryPageMatchesBoundary(
+          throughDisplayKey,
+          page.pagination.through_display_key_found,
+        )
+      ) {
+        // The backend deliberately served an ordinary fallback page after
+        // retention/rewind removed our anchor. Never prepend that unbounded
+        // page: it can contain the persisted active tail already owned by
+        // replay. Keep the current projection and fail closed until rebase.
+        historyPageOffset.current = 0
+        historyThroughDisplayKey.current = null
+        setEarlierHistoryAvailable(false)
+        return 0
+      }
 
       const older = reconstructMessages(page.messages)
       historyPageOffset.current = page.pagination.offset + page.pagination.returned

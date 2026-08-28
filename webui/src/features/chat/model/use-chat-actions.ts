@@ -32,6 +32,7 @@ type ActionRefs = {
   hydratingOpen: MutableRefObject<number | null>
   bufferedEvents: MutableRefObject<GatewayEvent[]>
   historyPageOffset: MutableRefObject<number>
+  historyThroughDisplayKey: MutableRefObject<string | null>
 }
 
 type ProfileDefaults = {
@@ -198,6 +199,7 @@ export function useChatActions({
     refs.hydratingOpen.current = null
     refs.bufferedEvents.current = []
     refs.historyPageOffset.current = 0
+    refs.historyThroughDisplayKey.current = null
     setEarlierHistoryAvailable(false)
     selectSessions(null, null)
     setMessages([])

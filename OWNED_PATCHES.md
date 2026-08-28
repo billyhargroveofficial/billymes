@@ -113,3 +113,19 @@ tail and concurrent live frames are applied afterward through one sequence
 watermark. Preserve generation ownership, current-tail retention, bounded
 convergence, and fail-closed behavior for a truncated gap. Content-based
 deduplication is not an acceptable substitute.
+
+Active-turn reload has an additional owned boundary. REST can contain an
+incrementally persisted portion of the active tail, so resume must be
+sent/applied before awaiting a slow history request and replay must be its only
+tail owner. The in-flight gateway state carries `history_anchor_display_key`,
+an immutable clone-safe key generated from the exact raw display-dedupe
+identity of the pre-turn row. It must never be replaced with a database row id,
+timestamp, or text matching: compression can clone physical rows and matching
+content is legitimate. The history adapter processes `through_display_key`
+before pagination and returns an explicit found marker; retain that same
+boundary for `load-earlier` until a full unbounded rebase, or disable older
+pages while the active boundary is unavailable/unconfirmed. Reject any later
+page whose marker says that retained boundary disappeared. A terminal event
+still clears active/busy state when its sequence is omitted at the replay base.
+Gateway orphan-reap grace is an operational guardrail only; correct resume
+ordering is what preserves the turn.

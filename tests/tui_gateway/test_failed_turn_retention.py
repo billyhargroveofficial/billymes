@@ -21,6 +21,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import types
 
@@ -132,7 +133,70 @@ def test_healthy_snapshot_carries_no_error_keys():
     server._append_inflight_delta(session, "hello")
 
     snapshot = server._inflight_snapshot(session)
-    assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
+    assert snapshot == {
+        "assistant": "hello",
+        "history_anchor_display_key": None,
+        "history_anchor_row_id": None,
+        "streaming": True,
+        "user": "hi",
+    }
+
+
+def test_first_inflight_turn_exposes_null_history_anchor(monkeypatch):
+    """An empty/new session has no durable prefix to anchor before its ask."""
+    session = _session()
+
+    @contextlib.contextmanager
+    def no_db(_session):
+        yield None
+
+    monkeypatch.setattr(server, "_session_db", no_db)
+    server._start_inflight_turn(session, "first prompt")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["history_anchor_display_key"] is None
+    assert snapshot["history_anchor_row_id"] is None
+
+
+def test_active_inflight_history_anchor_is_captured_once_before_tail_persists(monkeypatch):
+    """A later DB tail must not move a running turn's replay boundary."""
+    answers = iter(
+        (
+            {"row_id": 41, "display_key": "display:v1:before"},
+            {"row_id": 99, "display_key": "display:v1:after"},
+        )
+    )
+    requested_session_ids: list[str] = []
+
+    class _DB:
+        def latest_active_display_anchor(self, _session_key):
+            requested_session_ids.append(_session_key)
+            return next(answers)
+
+        def flush_token_counts(self):
+            raise AssertionError("capturing an anchor must not flush under history_lock")
+
+    @contextlib.contextmanager
+    def session_db(_session):
+        yield _DB()
+
+    # A compression rotation changes the agent's durable session id while the
+    # UI's stable session_key remains the root. Capture must anchor the live
+    # child, otherwise its previous turns would be cut from REST hydration.
+    session = _session(agent=types.SimpleNamespace(session_id="compression-tip"))
+    monkeypatch.setattr(server, "_session_db", session_db)
+    server._start_inflight_turn(session, "current prompt")
+    server._append_inflight_delta(session, "partial answer")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["history_anchor_display_key"] == "display:v1:before"
+    assert snapshot["history_anchor_row_id"] == 41
+    assert requested_session_ids == ["compression-tip"]
+    # Snapshotting is not a live DB query: rows written by a tool loop after
+    # the prompt began must belong to the tail, never become the baseline.
+    assert next(answers) == {"row_id": 99, "display_key": "display:v1:after"}
 
 
 # ── Returned-error path (run_conversation returns an error result) ────

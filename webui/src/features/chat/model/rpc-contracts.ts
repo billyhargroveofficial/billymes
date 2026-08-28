@@ -14,6 +14,14 @@ export type SessionResumeResult = {
   info: Record<string, unknown> | null
   running: boolean | null
   turn_started_at: number | null
+  inflight: {
+    user: string | null
+    /**
+     * `undefined` means an older gateway did not implement the anchor yet;
+     * explicit `null` is the valid before-first-row anchor for a new turn.
+     */
+    history_anchor_display_key: string | null | undefined
+  } | null
 }
 
 export type SessionEventsSinceResult = {
@@ -63,6 +71,18 @@ export function parseSessionCreateResult(value: unknown) {
 export function parseSessionResumeResult(value: unknown): SessionResumeResult {
   const result = expectRecord(value, 'session.resume result')
   const info = result.info == null ? null : expectRecord(result.info, 'session.resume result.info')
+  const inflight =
+    result.inflight == null ? null : expectRecord(result.inflight, 'session.resume result.inflight')
+  const displayKey =
+    inflight == null || !Object.hasOwn(inflight, 'history_anchor_display_key')
+      ? undefined
+      : optionalString(
+          inflight.history_anchor_display_key,
+          'session.resume result.inflight.history_anchor_display_key',
+        )
+  if (displayKey != null && !/^display:v1:[0-9a-f]{64}$/.test(displayKey)) {
+    throw new ApiPayloadError('session.resume result.inflight.history_anchor_display_key')
+  }
   return {
     session_id: optionalString(result.session_id, 'session.resume result.session_id'),
     stored_session_id:
@@ -77,6 +97,13 @@ export function parseSessionResumeResult(value: unknown): SessionResumeResult {
       (info
         ? optionalNumber(info.turn_started_at, 'session.resume result.info.turn_started_at')
         : null),
+    inflight:
+      inflight == null
+        ? null
+        : {
+            user: optionalString(inflight.user, 'session.resume result.inflight.user'),
+            history_anchor_display_key: displayKey,
+          },
   }
 }
 

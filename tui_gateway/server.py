@@ -9708,10 +9708,56 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
+def _inflight_history_anchor(session: dict) -> dict[str, Any]:
+    """Snapshot the durable display boundary immediately before a turn starts.
+
+    During a running turn the agent may persist its user/tool/assistant tail
+    incrementally while the WebUI is reconnecting.  A client must not infer
+    that tail from the last ``role=user`` row: synthetic continuation rows and
+    partially-persisted tool loops make that ambiguous.  Capture the last
+    durable row *before* the turn can write instead.  Its opaque display key
+    is immutable for this in-flight snapshot and survives compaction/cloning;
+    the physical SQLite id is retained only as optional diagnostics.
+
+    This is presentation/recovery metadata only.  A missing DB, a first turn,
+    or an older SessionDB surface returns ``None`` without delaying or failing
+    the user turn.
+    """
+    empty = {"display_key": None, "row_id": None}
+    session_key = str(session.get("session_key") or "").strip()
+    agent_session_id = getattr(session.get("agent"), "session_id", None)
+    session_id = str(agent_session_id or session_key).strip()
+    if not session_id:
+        return empty
+    try:
+        with _session_db(session) as db:
+            getter = getattr(db, "latest_active_display_anchor", None)
+            anchor = getter(session_id) if callable(getter) else None
+        if not isinstance(anchor, dict):
+            return empty
+        row_id = anchor.get("row_id")
+        display_key = anchor.get("display_key")
+        return {
+            "display_key": display_key if isinstance(display_key, str) and display_key else None,
+            "row_id": row_id
+            if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0
+            else None,
+        }
+    except Exception:
+        logger.debug("failed to capture in-flight history anchor", exc_info=True)
+    return empty
+
+
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
+    history_anchor = _inflight_history_anchor(session)
     session["inflight_turn"] = {
         "assistant": "",
+        # Must be captured before agent.run_conversation can append the
+        # current user/tool tail to state.db. Do not recompute on resume: the
+        # whole point is a stable boundary for this exact turn.
+        "history_anchor_display_key": history_anchor["display_key"],
+        "history_anchor_row_id": history_anchor["row_id"],
         "started_at": now,
         "streaming": True,
         "updated_at": now,
@@ -10331,6 +10377,26 @@ def _inflight_snapshot(session: dict) -> dict | None:
         return None
     snapshot = {
         "assistant": assistant,
+        # Stable opaque identity for display-history recovery.  Unlike the
+        # physical row id below it remains usable after compaction re-sequences
+        # a protected tail or a compression continuation clones the turn.
+        "history_anchor_display_key": (
+            str(turn["history_anchor_display_key"])
+            if isinstance(turn.get("history_anchor_display_key"), str)
+            and turn["history_anchor_display_key"].strip()
+            else None
+        ),
+        # Additive reconnect contract. ``None`` is meaningful: no durable
+        # prefix existed when this first turn began (or storage was
+        # unavailable).  This physical row id is diagnostic/legacy only;
+        # reconnect clients must prefer ``history_anchor_display_key``.
+        "history_anchor_row_id": (
+            int(turn["history_anchor_row_id"])
+            if isinstance(turn.get("history_anchor_row_id"), int)
+            and not isinstance(turn.get("history_anchor_row_id"), bool)
+            and int(turn["history_anchor_row_id"]) > 0
+            else None
+        ),
         "streaming": streaming,
         "user": user,
     }

@@ -8,6 +8,8 @@ import {
   parseSessionUsageResult,
 } from './rpc-contracts'
 
+const displayKey = `display:v1:${'a'.repeat(64)}`
+
 describe('chat JSON-RPC result contracts', () => {
   it('accepts only a non-empty session id from session.create', () => {
     expect(parseSessionCreateResult({ session_id: 'session-1', ignored: true })).toEqual({
@@ -27,6 +29,7 @@ describe('chat JSON-RPC result contracts', () => {
       parseSessionResumeResult({
         session_id: 'session-1',
         info: { model: 'fixture', running: true, turn_started_at: 12 },
+        inflight: { user: 'current prompt', history_anchor_display_key: displayKey },
       }),
     ).toEqual({
       session_id: 'session-1',
@@ -34,8 +37,26 @@ describe('chat JSON-RPC result contracts', () => {
       info: { model: 'fixture', running: true, turn_started_at: 12 },
       running: true,
       turn_started_at: 12,
+      inflight: { user: 'current prompt', history_anchor_display_key: displayKey },
     })
     expect(() => parseSessionResumeResult({ info: [] })).toThrow('session.resume result.info')
+    expect(() =>
+      parseSessionResumeResult({ inflight: { history_anchor_display_key: 1.5 } }),
+    ).toThrow('session.resume result.inflight.history_anchor_display_key')
+    expect(() =>
+      parseSessionResumeResult({
+        inflight: { history_anchor_display_key: 'display:v1:not-hex' },
+      }),
+    ).toThrow('session.resume result.inflight.history_anchor_display_key')
+    expect(
+      parseSessionResumeResult({
+        inflight: { user: 'first prompt', history_anchor_display_key: null },
+      }).inflight,
+    ).toEqual({ user: 'first prompt', history_anchor_display_key: null })
+    expect(parseSessionResumeResult({ inflight: { user: 'legacy prompt' } }).inflight).toEqual({
+      user: 'legacy prompt',
+      history_anchor_display_key: undefined,
+    })
   })
 
   it('parses replay envelopes and durable hosted presentation cards', () => {

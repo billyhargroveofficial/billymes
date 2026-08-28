@@ -15,6 +15,7 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 import asyncio  # noqa: F401 — used by handlers
 import json
 import logging
+import re
 import time  # noqa: F401
 from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
@@ -72,6 +73,28 @@ _CLIENT_MESSAGE_KEYS = frozenset(
         "interim_messages",
     }
 )
+
+_DISPLAY_KEY_RE = re.compile(r"display:v1:[0-9a-f]{64}\Z")
+
+
+def _page_display_messages(
+    messages: list[dict[str, Any]], *, limit: int, offset: int, latest: bool
+) -> tuple[list[dict[str, Any]], int]:
+    """Page an already-deduped display projection and return its user offset.
+
+    ``SessionDB.get_messages(include_compacted=True)`` deduplicates before it
+    applies paging.  A live-replay boundary has to cut that same display list
+    *before* pagination; doing it after a latest page can leave an active tail
+    on screen or produce an empty history when the boundary predates the page.
+    """
+    if latest:
+        end = max(0, len(messages) - offset)
+        start = max(0, end - limit)
+    else:
+        start = min(max(0, offset), len(messages))
+        end = min(len(messages), start + limit)
+    user_turn_offset = sum(message.get("role") == "user" for message in messages[:start])
+    return messages[start:end], user_turn_offset
 
 
 def _client_message_projection(message: dict[str, Any]) -> dict[str, Any]:
@@ -743,11 +766,17 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    through_display_key: Optional[str] = Query(None),
 ):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
             detail="order must be one of: oldest, latest",
+        )
+    if through_display_key is not None and not _DISPLAY_KEY_RE.fullmatch(through_display_key):
+        raise HTTPException(
+            status_code=422,
+            detail="through_display_key must be a display:v1 SHA-256 key",
         )
 
     def _read():
@@ -765,34 +794,82 @@ async def get_session_messages(
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
             _limit = 500 if default_page else min(limit, 500)
-            messages = db.get_messages(
-                sid,
-                limit=_limit,
-                offset=offset,
-                latest=latest_page,
-                include_compacted=include_compacted,
-                # The SPA's durable display hydration must match
-                # session.resume: compacted history spans only the selected
-                # conversation's compression root→tip, never branch/tool
-                # children.
-                include_ancestors=include_compacted,
-            )
-            user_turn_offset = db.get_user_turn_offset(
-                sid,
-                limit=_limit,
-                offset=offset,
-                latest=latest_page,
-                include_compacted=include_compacted,
-                include_ancestors=include_compacted,
-            )
-            return sid, _limit, messages, user_turn_offset
+            display_key = through_display_key if include_compacted else None
+            through_display_key_found: bool | None = None
+            if display_key:
+                # ``include_compacted`` reads the entire selected lineage to
+                # dedupe generation clones before it pages. Mirror that order:
+                # cut the deduped display history through the live-turn
+                # boundary first, then select the requested latest/offset
+                # page. Filtering a pre-paged result by physical SQLite id is
+                # wrong after compaction re-sequences a protected tail.
+                display_messages = db.get_messages(
+                    sid,
+                    include_compacted=True,
+                    include_ancestors=True,
+                    include_display_keys=True,
+                )
+                # A deduped display normally makes the key unique. Search
+                # from the newest end anyway: malformed/legacy rows can share
+                # a logical identity, and the active/newest representation is
+                # the one the display reader itself prefers.
+                anchor_index = next(
+                    (
+                        index
+                        for index in range(len(display_messages) - 1, -1, -1)
+                        if display_messages[index].get("display_key") == display_key
+                    ),
+                    None,
+                )
+                if anchor_index is not None:
+                    messages, user_turn_offset = _page_display_messages(
+                        display_messages[: anchor_index + 1],
+                        limit=_limit,
+                        offset=offset,
+                        latest=latest_page,
+                    )
+                    through_display_key_found = True
+                else:
+                    # An anchor can disappear due to rewind/retention between
+                    # session.resume and this REST read. Preserve the normal
+                    # page rather than returning an empty/truncated transcript;
+                    # the caller can use its conservative replay fallback.
+                    messages, user_turn_offset = _page_display_messages(
+                        display_messages,
+                        limit=_limit,
+                        offset=offset,
+                        latest=latest_page,
+                    )
+                    through_display_key_found = False
+            else:
+                messages = db.get_messages(
+                    sid,
+                    limit=_limit,
+                    offset=offset,
+                    latest=latest_page,
+                    include_compacted=include_compacted,
+                    # The SPA's durable display hydration must match
+                    # session.resume: compacted history spans only the selected
+                    # conversation's compression root→tip, never branch/tool
+                    # children.
+                    include_ancestors=include_compacted,
+                )
+                user_turn_offset = db.get_user_turn_offset(
+                    sid,
+                    limit=_limit,
+                    offset=offset,
+                    latest=latest_page,
+                    include_compacted=include_compacted,
+                    include_ancestors=include_compacted,
+                )
+            return sid, _limit, messages, user_turn_offset, through_display_key_found
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages, user_turn_offset = result
+    sid, _limit, messages, user_turn_offset, through_display_key_found = result
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
     from agent.interim_display import project_interim_assistant_messages
@@ -842,6 +919,10 @@ async def get_session_messages(
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(projected_messages),
             "user_turn_offset": user_turn_offset,
+            # null means no compaction boundary was requested/applicable;
+            # false means a validated key was not present and ordinary paging
+            # was deliberately served as the safe fallback.
+            "through_display_key_found": through_display_key_found,
         },
     }
 

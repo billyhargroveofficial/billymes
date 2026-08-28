@@ -69,6 +69,22 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
   release the current attempt's live buffer. Baseline convergence is bounded;
   a truncated post-refresh gap or unstable cursor must fail without claiming
   unseen `latest_seq` events.
+- An F5 during an active turn has one owner per segment. REST can already have
+  the incrementally persisted active tail, while replay still contains its live
+  events. Send and apply `session.resume` before awaiting REST so the gateway
+  recognizes the reconnect rather than orphan-reaping it. Use the in-flight
+  `history_anchor_display_key` through `through_display_key` to request only
+  the pre-turn REST prefix; the server applies this cut before pagination and
+  returns a found marker. The key is immutable and clone-safe because it comes
+  from the exact raw display-dedupe identity, not row ids, timestamps, or text.
+  Replay is then the only source for the active tail. Keep that boundary on
+  every older-page fetch until a full unbounded rebase. Lifecycle state is not
+  merely render data: if no exact boundary is confirmed, older-page loading
+  stays disabled for that active projection. If a retained key later returns
+  `found=false`, reject that page rather than prepending its unbounded fallback.
+  A terminal frame at or below
+  `replay_base_seq` must still clear busy/active state. Orphan-reap grace is a
+  guardrail, not an excuse to reverse this ordering.
 - `stop()` sends `session.interrupt` for the active live session and clears the
   local busy state. `newChat()` invalidates stale generations and best-effort
   interrupts a busy previous session. Closed/error states must leave the UI
@@ -79,7 +95,10 @@ the full list — long sessions run to hundreds of markdown-heavy rows.
 - History uses chronological pages of at most 500 rows. The REST
   `pagination.user_turn_offset` is the number of visible user turns before the
   returned page. Store the offset of the oldest loaded page and re-merge the
-  full cached presentation ledger after prepending older rows.
+  full cached presentation ledger after prepending older rows. While an active
+  turn uses `through_display_key`, retain exactly that same server boundary for
+  every older page; do not reintroduce the persisted tail by paginating an
+  unbounded history between reload and terminal rebase.
 - `session.presentation.list` is display-only and bounded to 256 cards. A
   provider batch remains several cards with stable order and non-zero provider
   durations, while the transcript keeps zero synthetic function/tool rows.

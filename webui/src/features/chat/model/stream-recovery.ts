@@ -50,8 +50,37 @@ type DurableReplayRecoveryOptions = {
   initial: SessionEventsSinceResult
   lastSeen: number
   forceRefresh: boolean
+  /** session.resume is authoritative when a prior cursor omitted message.start. */
+  initialActiveTurn?: boolean
   requestSince: (cursor: number) => Promise<SessionEventsSinceResult>
-  refreshHistory: () => Promise<void>
+  refreshHistory: (options: { omitActiveReplayTail: boolean }) => Promise<void>
+}
+
+const TERMINAL_TURN_EVENTS = new Set(['message.complete', 'turn.end', 'error'])
+
+/**
+ * Whether the snapshot contains an unfinished turn after its REST-covered
+ * prefix.  Gateway control/usage frames after an already completed turn must
+ * not be mistaken for an active transcript tail.
+ */
+export function hasActiveReplayTail(replay: SessionEventsSinceResult) {
+  let started = false
+  for (const event of replay.events) {
+    if (event.seq != null && event.seq <= replay.replay_base_seq) continue
+    if (event.type === 'message.start') started = true
+    else if (started && TERMINAL_TURN_EVENTS.has(event.type)) started = false
+  }
+  return started
+}
+
+/** Apply event lifecycle edges to an already-known live-turn state. */
+function advanceReplayTurnActivity(active: boolean, events: readonly GatewayEvent[]) {
+  let next = active
+  for (const event of events) {
+    if (event.type === 'message.start') next = true
+    else if (TERMINAL_TURN_EVENTS.has(event.type)) next = false
+  }
+  return next
 }
 
 /**
@@ -65,20 +94,26 @@ export async function recoverDurableReplay({
   initial,
   lastSeen,
   forceRefresh,
+  initialActiveTurn = false,
   requestSince,
   refreshHistory,
 }: DurableReplayRecoveryOptions) {
   let replay = initial
   let cursor = lastSeen
+  // `session.resume` can say running while the first snapshot already covers
+  // its terminal event. Lifecycle is state, not replay payload: inspect the
+  // complete ordered snapshot before deciding whether REST needs tail hiding.
+  let activeTurn = advanceReplayTurnActivity(initialActiveTurn, replay.events)
   let refreshRequired = forceRefresh || replay.truncated || replay.replay_base_seq > cursor
   let refreshes = 0
   while (refreshRequired) {
     if (refreshes >= MAX_REPLAY_REFRESHES) {
       throw new Error('replay baseline did not stabilize')
     }
-    await refreshHistory()
+    await refreshHistory({ omitActiveReplayTail: activeTurn })
     cursor = Math.max(cursor, replay.replay_base_seq)
     replay = await requestSince(cursor)
+    activeTurn = advanceReplayTurnActivity(activeTurn, replay.events)
     refreshes += 1
     if (replay.truncated) throw new Error('post-refresh replay is truncated')
     // A newer baseline appeared while REST was being read. Repeat the
@@ -88,6 +123,7 @@ export async function recoverDurableReplay({
   return {
     cursor,
     latestSeq: replay.latest_seq,
+    activeTurn,
     events: replay.events.filter((event) => event.seq == null || event.seq > cursor),
   }
 }

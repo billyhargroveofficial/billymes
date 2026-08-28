@@ -69,6 +69,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
   const reconnectRecoveryBuffer = useRef(new ReplayRecoveryBuffer())
   const historyPageOffset = useRef(0)
   const historyUserTurnOffset = useRef(0)
+  const historyThroughDisplayKey = useRef<string | null>(null)
   const historyHasEarlierRef = useRef(false)
   const historyPageLoading = useRef(false)
   const presentationCardsRef = useRef(new Map<string, readonly SessionPresentationCard[]>())
@@ -242,6 +243,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
     recoveryBuffer: reconnectRecoveryBuffer,
     historyPageOffset,
     historyUserTurnOffset,
+    historyThroughDisplayKey,
     selectSessions,
     setMessages,
     setBusy,
@@ -303,6 +305,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       bufferedEvents,
       historyPageOffset,
       historyUserTurnOffset,
+      historyThroughDisplayKey,
       historyHasEarlier: historyHasEarlierRef,
       historyPageLoading,
       eventWatermarks,
@@ -339,6 +342,7 @@ function ProfileChatRuntime({ children, profile }: { children: ReactNode; profil
       hydratingOpen,
       bufferedEvents,
       historyPageOffset,
+      historyThroughDisplayKey,
     },
     draft,
     busy,
