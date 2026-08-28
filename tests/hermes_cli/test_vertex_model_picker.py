@@ -27,6 +27,7 @@ def test_vertex_has_curated_model_list():
     assert models, "_PROVIDER_MODELS must have a non-empty 'vertex' entry"
     # Vertex's openapi endpoint expects the google/ publisher prefix.
     assert all(m.startswith("google/") for m in models)
+    assert "google/gemini-3.7-flash" in models
 
 
 def test_vertex_appears_when_credentials_configured():
