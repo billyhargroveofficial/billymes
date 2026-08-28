@@ -499,6 +499,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
+    "- Calibrate investigation depth to the task. For a simple factual lookup, stop once the "
+    "answer is grounded in an authoritative current source; do not expand it into exhaustive research.\n"
     "- Do not stop early when another tool call would materially improve the result.\n"
     "- If a tool returns empty, partial, or suspiciously narrow results, retry "
     "with a broader or different query or strategy before concluding.\n"
@@ -510,7 +512,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
     "- Arithmetic, math, calculations → use terminal or execute_code\n"
     "- Hashes, encodings, checksums → use terminal (e.g. sha256sum, base64)\n"
-    "- Current time, date, timezone → use terminal (e.g. date)\n"
+    "- Exact current clock time or live timezone state → use terminal (e.g. date). "
+    "The current calendar date already supplied in conversation metadata may be used directly.\n"
     "- System state: OS, CPU, memory, disk, ports, processes → use terminal\n"
     "- File contents, sizes, line counts → use read_file, search_files, or terminal\n"
     "- Git history, branches, diffs → use terminal\n"
@@ -2083,14 +2086,14 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
+            "## Skills (selective)\n"
+            "Before replying, scan the skills below. Load a skill with skill_view(name) when it "
+            "directly matches the task and its specialized workflow will materially improve the result. "
+            "Do not load a merely adjacent or partially relevant skill. In particular, skip skill_view "
+            "for simple factual questions, quick web lookups, routine chat, and tasks that the active "
+            "basic tools can already complete directly. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            f"even if you think you could handle the task with basic tools like {_basic_tools}. "
+            "and proven workflows that outperform general-purpose approaches on substantive matching tasks. "
             "Skills also encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
@@ -2108,7 +2111,7 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Proceed directly when no skill is clearly and materially applicable."
             + hidden_note
         )
 

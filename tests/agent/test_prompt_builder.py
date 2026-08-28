@@ -309,6 +309,18 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_skill_guidance_skips_quick_web_lookups(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "research" / "deep-research"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: deep-research\ndescription: Formal research\n---\n"
+        )
+        result = build_skills_system_prompt()
+        assert "## Skills (selective)" in result
+        assert "skip skill_view for simple factual questions, quick web lookups" in result
+        assert "hermes-agent" in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
@@ -915,6 +927,14 @@ class TestToolUseEnforcementGuidance:
     def test_guidance_requires_action(self):
         assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
 
+    def test_execution_guidance_does_not_refetch_injected_calendar_date(self):
+        assert "current calendar date already supplied" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "Current time, date, timezone" not in OPENAI_MODEL_EXECUTION_GUIDANCE
+
+    def test_execution_guidance_calibrates_simple_lookup_depth(self):
+        assert "For a simple factual lookup, stop once" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "do not expand it into exhaustive research" in OPENAI_MODEL_EXECUTION_GUIDANCE
+
 
 
 
@@ -1008,5 +1028,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
